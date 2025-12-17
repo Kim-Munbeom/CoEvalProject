@@ -47,7 +47,11 @@ cd CoEval
 
 ```bash
 # uv가 설치되어 있지 않다면
-pip install uv
+# macOS/Linux:
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows:
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
 # 의존성 설치
 uv sync
