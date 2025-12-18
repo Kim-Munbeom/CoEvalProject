@@ -11,7 +11,7 @@ st.set_page_config(
 # 타이틀
 st.title("📊 CoEval - 답변 평가 시스템")
 st.markdown(
-    "AI 답변의 품질을 **실행 가능성**, **전문성**, **현실성** 기준으로 평가합니다."
+    "AI 답변의 품질을 **멀티 에이전트 시스템**으로 평가하여 **0-10점 스케일**과 **등급(D/C/B/A/S)**을 제공합니다."
 )
 
 # API 엔드포인트 설정
@@ -22,10 +22,19 @@ with st.sidebar:
     st.header("⚙️ 설정")
     api_url = st.text_input("API URL", value=API_URL)
     st.markdown("---")
-    st.markdown("### 평가 기준")
-    st.markdown("**실행 가능성**: 구체적인 행동 단계, 수치, 예시, 도구명 포함")
-    st.markdown("**전문성**: 실무 경험, 직무 지식, 전문적 디테일")
-    st.markdown("**현실성**: 멘티 상황 고려, Why/When/리스크 제공")
+    st.markdown("### 평가 시스템")
+    st.markdown("**4개 에이전트 구성:**")
+    st.markdown("- 🎯 **Action Master**: 실행 지침 검수")
+    st.markdown("- 🔬 **Pro Proof**: 실무 디테일 검증")
+    st.markdown("- 🌍 **Context Guardian**: 현실성 분석")
+    st.markdown("- 📊 **Quality Consensus**: 최종 종합 조정")
+    st.markdown("---")
+    st.markdown("### 등급 체계")
+    st.markdown("- **S등급 (9-10점)**: 완벽한 답변")
+    st.markdown("- **A등급 (8-9점)**: 우수한 답변")
+    st.markdown("- **B등급 (6-8점)**: 양호한 답변")
+    st.markdown("- **C등급 (3-6점)**: 부족한 답변")
+    st.markdown("- **D등급 (0-3점)**: 미달 답변")
 
 # 메인 컨텐츠
 st.header("📝 평가할 답변 입력")
@@ -51,12 +60,6 @@ with col2:
         key="answer",
     )
 
-expected_output = st.text_input(
-    "기대 출력 (선택사항)",
-    placeholder="예: 구체적이고 실행 가능한 조언",
-    key="expected",
-)
-
 # 평가 버튼
 if st.button("🔍 평가 시작", type="primary", use_container_width=True):
     if not question or not answer:
@@ -69,7 +72,6 @@ if st.button("🔍 평가 시작", type="primary", use_container_width=True):
                     {
                         "input": question,
                         "actual_output": answer,
-                        "expected_output": expected_output if expected_output else None,
                     }
                 ]
             }
@@ -89,50 +91,122 @@ if st.button("🔍 평가 시작", type="primary", use_container_width=True):
 
                 if result.get("test_results"):
                     test_result = result["test_results"][0]
+                    rubric = test_result["rubric_evaluation"]
 
-                    # 전체 성공 여부
-                    if test_result["success"]:
-                        st.success("✅ 전체 평가 통과!")
-                    else:
-                        st.error("❌ 일부 평가 항목이 기준을 충족하지 못했습니다.")
+                    # 최종 점수 및 등급 표시
+                    st.header("🎯 최종 평가 결과")
 
+                    col1, col2, col3, col4 = st.columns(4)
+
+                    with col1:
+                        # 등급 색상 설정
+                        grade_colors = {
+                            "S": "#FFD700",  # 금색
+                            "A": "#90EE90",  # 연두색
+                            "B": "#87CEEB",  # 하늘색
+                            "C": "#FFA500",  # 주황색
+                            "D": "#FF6347"   # 빨간색
+                        }
+                        grade_color = grade_colors.get(rubric["grade"], "#808080")
+
+                        st.markdown(
+                            f"""
+                            <div style="text-align: center; padding: 20px; background-color: {grade_color}; border-radius: 10px;">
+                                <h1 style="color: white; margin: 0; font-size: 48px;">{rubric['grade']}</h1>
+                                <p style="color: white; margin: 0; font-size: 14px;">등급</p>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                    with col2:
+                        st.metric(
+                            "점수 (0-10)",
+                            f"{rubric['absolute_score']:.1f}",
+                            delta=f"{rubric['grade']} 등급"
+                        )
+
+                    with col3:
+                        st.metric(
+                            "정규화 점수",
+                            f"{rubric['score']:.2f}",
+                            delta=f"기준: {rubric['threshold']:.2f}"
+                        )
+
+                    with col4:
+                        if rubric["success"]:
+                            st.success("✅ 통과")
+                        else:
+                            st.error("❌ 미달")
+
+                    # 평가 근거
                     st.markdown("---")
+                    st.subheader("📝 평가 근거")
+                    st.markdown(
+                        f"""
+                        <div style="background-color: #f0f2f6; padding: 20px; border-radius: 10px; border-left: 6px solid {grade_color};">
+                            <p style="color: #1f1f1f; margin: 0; font-size: 16px; line-height: 1.8;">
+                                {rubric['reason']}
+                            </p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
 
-                    # 각 메트릭 결과 표시
-                    st.header("📈 평가 결과 상세")
+                    # 에이전트별 상세 분석
+                    st.markdown("---")
+                    st.header("🤖 에이전트별 상세 분석")
 
-                    for idx, metric in enumerate(test_result["metrics"]):
+                    agent_icons = {
+                        "action_master": "🎯",
+                        "pro_proof": "🔬",
+                        "context_guardian": "🌍",
+                        "quality_consensus": "📊"
+                    }
+
+                    agent_names = {
+                        "action_master": "Action Master (실행 지침 검수)",
+                        "pro_proof": "Pro Proof (실무 디테일 검증)",
+                        "context_guardian": "Context Guardian (현실성 분석)",
+                        "quality_consensus": "Quality Consensus (최종 종합 조정)"
+                    }
+
+                    for agent in test_result["agent_responses"]:
+                        agent_id = agent["agent_name"]
+                        icon = agent_icons.get(agent_id, "🤖")
+                        name = agent_names.get(agent_id, agent_id)
+
                         with st.expander(
-                            f"**{metric['name']}** - 점수: {metric['score']:.2f} / 기준: {metric['threshold']}",
-                            expanded=True,
+                            f"{icon} **{name}** (실행: {agent['execution_time']:.2f}초)",
+                            expanded=(agent_id == "quality_consensus")
                         ):
-                            col1, col2, col3 = st.columns([2, 1, 1])
+                            st.markdown(agent["response_text"])
 
-                            with col1:
-                                # 진행바
-                                st.progress(metric["score"])
+                            # 토큰 사용량 정보
+                            if agent.get("token_usage"):
+                                st.caption(
+                                    f"📊 토큰 사용량: {agent['token_usage'].get('totalTokens', 0):,} "
+                                    f"(입력: {agent['token_usage'].get('inputTokens', 0):,}, "
+                                    f"출력: {agent['token_usage'].get('outputTokens', 0):,})"
+                                )
 
-                            with col2:
-                                st.metric("점수", f"{metric['score']:.2f}")
+                    # 실행 정보
+                    st.markdown("---")
+                    st.subheader("⚡ 실행 정보")
 
-                            with col3:
-                                if metric["success"]:
-                                    st.success("통과 ✅")
-                                else:
-                                    st.error("미달 ❌")
+                    info_col1, info_col2, info_col3 = st.columns(3)
 
-                            # 평가 이유
-                            st.markdown("**평가 근거:**")
-                            st.markdown(
-                                f"""
-                                <div style="background-color: #f0f2f6; padding: 10px; border-radius: 5px; border-left: 4px solid #4CAF50;">
-                                    <p style="color: #1f1f1f; margin: 0; font-size: 16px; line-height: 1.6;">
-                                        {metric['reason']}
-                                    </p>
-                                </div>
-                                """,
-                                unsafe_allow_html=True,
-                            )
+                    with info_col1:
+                        st.metric("총 실행 시간", f"{test_result['total_execution_time']:.2f}초")
+
+                    with info_col2:
+                        st.metric("총 토큰 사용량", f"{test_result['total_tokens']:,}")
+
+                    with info_col3:
+                        st.metric("평가 비용", f"${rubric['evaluation_cost']:.4f}")
+
+                    st.caption(f"실행 순서: {' → '.join(test_result['execution_order'])}")
+                    st.caption(f"평가 모델: {rubric['evaluation_model']}")
 
                     # JSON 결과 보기
                     with st.expander("🔍 전체 JSON 결과 보기"):
@@ -191,9 +265,6 @@ if st.session_state.show_samples:
                 key=f"sample_answer_{idx}",
             )
 
-            st.markdown(f"**기대 출력:**")
-            st.caption(example["expected"])
-
             # 선택 버튼
             if st.button(
                 f"📥 이 예시 불러오기",
@@ -201,13 +272,12 @@ if st.session_state.show_samples:
                 use_container_width=True,
             ):
                 # 기존 위젯 키 삭제
-                for key in ["question", "answer", "expected"]:
+                for key in ["question", "answer"]:
                     if key in st.session_state:
                         del st.session_state[key]
                 # 새 값 설정
                 st.session_state.question = example["question"]
                 st.session_state.answer = example["answer"]
-                st.session_state.expected = example["expected"]
                 st.session_state.show_samples = None  # 목록 숨기기
                 st.rerun()
 
