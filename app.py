@@ -35,16 +35,16 @@ with st.sidebar:
     st.markdown("  - 3개 영역 점수 종합 및 조정")
     st.markdown("---")
     st.markdown("### 등급 체계")
-    st.markdown("**3개 영역 종합 평가:**")
+    st.markdown("**3개 영역 종합 평가 (10점 만점):**")
     st.markdown("- **S등급 (9-10점)**: 완벽")
     st.markdown("  - 실행성·전문성·현실성 모두 우수")
-    st.markdown("- **A등급 (8-9점)**: 우수")
+    st.markdown("- **A등급 (7-8점)**: 우수")
     st.markdown("  - 수치/도구/단계 + 리스크 관리")
-    st.markdown("- **B등급 (6-8점)**: 양호")
+    st.markdown("- **B등급 (5-6점)**: 양호")
     st.markdown("  - 구체적 단계 + 실무 지식 포함")
-    st.markdown("- **C등급 (3-6점)**: 부족")
+    st.markdown("- **C등급 (3-4점)**: 부족")
     st.markdown("  - 추상적, 멘티 상황 고려 부족")
-    st.markdown("- **D등급 (0-3점)**: 미달")
+    st.markdown("- **D등급 (0-2점)**: 미달")
     st.markdown("  - 필수 조건 결여 (실행성/전문성)")
 
 # 메인 컨텐츠
@@ -132,16 +132,16 @@ if st.button("🔍 평가 시작", type="primary", use_container_width=True):
 
                     with col2:
                         st.metric(
-                            "점수 (0-10)",
+                            "총점 (10점 만점)",
                             f"{rubric['absolute_score']:.1f}",
                             delta=f"{rubric['grade']} 등급"
                         )
 
                     with col3:
                         st.metric(
-                            "정규화 점수",
+                            "정규화 점수 (0-1)",
                             f"{rubric['score']:.2f}",
-                            delta=f"기준: {rubric['threshold']:.2f}"
+                            delta=f"합격 기준: {rubric['threshold']:.2f}"
                         )
 
                     with col4:

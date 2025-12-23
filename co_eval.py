@@ -5,14 +5,29 @@ CoEval: 멘토링 답변 품질 평가 시스템
 멘토링 답변의 품질을 종합적으로 평가하는 FastAPI 애플리케이션입니다.
 
 주요 기능:
-- 멀티 에이전트 시스템을 통한 다각도 평가 (실행성, 전문성, 현실성)
+- 멀티 에이전트 시스템을 통한 다각도 평가 (실행가능성, 전문성, 현실성)
 - DeepEval Rubric 기반 정량적 점수 산출 (0-10 스케일)
-- 등급 체계 (D/C/B/A/S) 자동 산정
+- 등급 체계 (D/C/B/A/S) 자동 산정 및 과락 규칙 적용
+- JSON 기반 구조화된 에이전트 응답 파싱
 - 평가 이유 한글 번역 제공
+- 상세 로깅 및 에러 핸들링
+
+점수 체계:
+- 에이전트 평가: 실행가능성 0-4점 + 전문성 0-4점 + 현실성 0-2점 = 10점 만점
+- DeepEval 평가: 에이전트 10점을 그대로 사용하여 Rubric 평가 (0-10 범위)
+- 등급 기준: D(0-2), C(3-4), B(5-6), A(7-8), S(9-10)
+
+버전 개선사항:
+- 에이전트 시스템 프롬프트를 JSON 전용 출력으로 변경
+- 10점 만점 체계로 통일 (actionability: 0-4, expertise: 0-4, context_fit: 0-2)
+- quality_consensus의 과락 규칙 (실행가능성 또는 전문성 ≤ 1점) 적용
+- 구조화된 parsed_data 필드 추가로 에이전트 점수 접근성 향상
 """
 
 import asyncio
 import concurrent.futures
+import json
+import logging
 import os
 from typing import List, Optional, Dict, Any
 
@@ -30,6 +45,12 @@ from strands.multiagent import GraphBuilder
 
 # 환경 변수 로드 (.env 파일에서 API 키 등 로드)
 load_dotenv()
+
+# 로깅 설정
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 # FastAPI 애플리케이션 인스턴스 생성
 app = FastAPI()
@@ -72,72 +93,119 @@ async def translate_to_korean_async(text: str) -> str:
     Returns:
         str: 번역된 한글 텍스트 (실패 시 원문)
     """
-    try:
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: genai_client.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=f"다음 영어 텍스트를 자연스러운 한국어로 번역해주세요. 번역문만 출력하고 다른 설명은 하지 마세요:\n\n{text}",
-            ),
+
+    def _generate_translation() -> str:
+        """동기적으로 번역을 수행하는 내부 함수"""
+        response = genai_client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=f"다음 영어 텍스트를 자연스러운 한국어로 번역해주세요. 번역문만 출력하고 다른 설명은 하지 마세요:\n\n{text}",
         )
         return response.text.strip()
-    except Exception:
-        # 번역 실패 시 원문 반환
+
+    try:
+        loop = asyncio.get_event_loop()
+        response_text = await loop.run_in_executor(None, _generate_translation)
+        return response_text
+    except (ValueError, RuntimeError, ConnectionError) as e:
+        # 번역 실패 시 원문 반환 (구체적인 예외 처리)
+        logger.warning(f"Translation failed: {e}")
         return text
 
 
 # 에이전트 설정 데이터 (데이터 기반 구성으로 유지보수성 향상)
 AGENT_CONFIGS = {
     "action_master": {
-        "description": "실행 지침 검수자",
-        "system_prompt": """역할: 실행 지침 검수자.
-        평가 기준: 수치·도구명 포함, 동사 중심 행동, Action Item 존재.
-        출력 형식:
-        - 판정: [PASS / FAIL]
-        - 기준1(구체성): (평가 근거 1문장)
-        - 기준2(행동성): (평가 근거 1문장)
-        - 기준3(리스트): (평가 근거 1문장)""",
+        "description": "실행가능성 분석가(Actionability Expert)",
+        "system_prompt": """# Role
+당신은 Q&A 플랫폼의 '실행가능성 분석가'입니다.
+
+# Evaluation Criteria: [구체성 & 실행 가능성] (0~4점)
+* **4점 (탁월):** 구체적 행동 지침(Step-by-step), 수치, 도구 등이 완벽하여 즉시 실행 가능하다.
+* **3점 (우수):** 실행 방법은 구체적이나, 예시나 사소한 디테일이 하나 정도 부족하다.
+* **2점 (보통):** 방향은 맞으나 '어떻게'에 대한 설명이 다소 일반적이다.
+* **1점 (미흡):** 추상적인 조언 위주라 무엇부터 해야 할지 막막하다.
+* **0점 (무의미):** 실행 불가능하거나 내용이 없다.
+
+# Output Instruction (JSON Only)
+{
+  "category": "actionability",
+  "score": (0~4 정수),
+  "reasoning": "(핵심 근거 1문장)"
+}""",
     },
     "pro_proof": {
-        "description": "실무 디테일 검증가",
-        "system_prompt": """역할: 실무 디테일 검증가. 지식 추가 설명 절대 금지.
-        평가 기준: 전문 용어/프로세스 정확성, 경험 기반 인과관계 설명.
-        출력 형식:
-        - 판정: [현업수준 / 검색수준]
-        - 기준1(전문성): (평가 근거 1문장)
-        - 기준2(경험근거): (평가 근거 1문장)""",
+        "description": "직무 전문가(Domain Expert)",
+        "system_prompt": """# Role
+당신은 해당 업계의 '직무 전문가'입니다.
+
+# Evaluation Criteria: [전문성 & 경험] (0~4점)
+* **4점 (탁월):** 현업 용어/프로세스가 완벽하며, 실제 경험 기반의 깊은 인사이트가 있다.
+* **3점 (우수):** 정확한 실무 지식과 도구를 다루고 있으나, 고유한 경험보다는 정보 전달 위주다.
+* **2점 (보통):** 검색하면 나오는 일반적인 지식 수준이다. 틀린 내용은 없다.
+* **1점 (미흡):** 전문 용어가 어색하거나 비전문가도 할 수 있는 얕은 조언이다.
+* **0점 (무의미):** 전문성이 없거나 잘못된 정보다.
+
+# Output Instruction (JSON Only)
+{
+  "category": "expertise",
+  "score": (0~4 정수),
+  "reasoning": "(핵심 근거 1문장)"
+}""",
     },
     "context_guardian": {
-        "description": "현실성 분석가",
-        "system_prompt": """역할: 현실성 분석가. 멘티 상담 및 대안 제시 금지.
-        평가 기준: 멘티 상황 적합성, 실행 리스크 언급, 조언의 맥락.
-        출력 형식:
-        - 판정: [실현가능 / 불투명]
-        - 기준1(적합성): (평가 근거 1문장)
-        - 기준2(리스크): (평가 근거 1문장)
-        - 기준3(맥락): (평가 근거 1문장)""",
+        "description": "현실성 분석가(Context Analyst)",
+        "system_prompt": """# Role
+당신은 멘티의 상황을 파악하는 '현실성 분석가'입니다.
+
+# Evaluation Criteria: [현실성 & 맥락 적합성] (0~2점)
+* **2점 (적합):** 멘티의 상황/연차를 고려했으며, 현실적인 제약이나 주의점(Risk)까지 짚어주었다.
+* **1점 (보통):** 질문에 대한 답은 되지만, 멘티의 구체적 상황보다는 일반론에 가깝다.
+* **0점 (부적합):** 멘티 상황과 맞지 않거나 복사 붙여넣기 식 답변이다.
+
+# Output Instruction (JSON Only)
+{
+  "category": "context_fit",
+  "score": (0~2 정수),
+  "reasoning": "(핵심 근거 1문장)"
+}""",
     },
     "quality_consensus": {
-        "description": "품질 합의 조정자",
-        "system_prompt": """역할: 품질 합의 조정자. 직접적인 조언 및 대안 제시 금지.
-        수행 임무:
-        1. 3개 에이전트 점수 합산 및 평균 도출.
-        2. 의견 충돌(점수 차이 3점 이상) 발생 시 결론만 확정.
-        3. 평가 근거는 에이전트별 1문장으로만 요약.
+        "description": "종합 평가 위원장(Master Judge)",
+        "system_prompt": """# Role
+당신은 '종합 평가 위원장'입니다. 3명의 분석가 데이터를 종합하여 최종 등급(10점 만점)을 매기고 통합 피드백을 제공합니다.
 
-        출력 형식:
-        ## 멘토 답변 종합 리포트
+# Scoring Rules (총 10점 만점)
+* **총점:** Agent 1(4점) + Agent 2(4점) + Agent 3(2점) 합계
 
-        ### 1. 에이전트별 요약
-        - [Action Master]: (점수) / (평가 1문장)
-        - [Pro Proof]: (점수) / (평가 1문장)
-        - [Context Guardian]: (점수) / (평가 1문장)
+# Grading System (5 Grades)
+* **S등급 (9~10점):** 완벽에 가까운 답변. (즉시 채택 권장)
+* **A등급 (7~8점):** 훌륭한 답변. (디테일 보완 시 완벽)
+* **B등급 (5~6점):** 평범한 답변. (도움은 되나 깊이가 부족)
+* **C등급 (3~4점):** 아쉬운 답변. (핵심 요소 결여)
+* **D등급 (0~2점):** 도움 되지 않음.
 
-        ### 2. 종합 판정
-        - 종합 점수: (평균 점수)
-        - 핵심 결격 사유: (가장 낮은 점수의 이유 1문장)
-        - 최종 결과: [승인 / 보류 / 반려]""",
+# 🔒 Essential Conditions (과락)
+* [실행가능성]이나 [전문성] 중 하나라도 **1점 이하**일 경우, 총점이 아무리 높아도 최대 등급은 **C등급**으로 제한됩니다.
+
+# Input Data
+- Agent 1, 2, 3의 JSON 결과
+- 멘토의 원본 답변
+
+# Output Format (JSON)
+{
+  "final_evaluation": {
+    "grade": "S/A/B/C/D",
+    "total_score": (0~10 정수),
+    "breakdown": {
+      "actionability": (0~4 점수),
+      "expertise": (0~4 점수),
+      "context_fit": (0~2 점수)
+    }
+  },
+  "essential_condition_met": true/false,
+  "summary_feedback": "(답변의 장점을 요약한 한 문장)",
+  "integrated_improvement": "(등급 상승을 위해 가장 시급하게 보완해야 할 구체적 조언 1가지. 완벽하다면 '없음' 표기)"
+}""",
     },
 }
 
@@ -202,22 +270,27 @@ evaluation_graph = build_evaluation_graph(evaluation_agents)
 # ==================== Phase 1: 전역 메트릭 및 동시성 제어 ====================
 
 # Rubric 정의 전역화 (매번 생성하지 않고 재사용)
+# 에이전트 10점 만점 체계를 그대로 DeepEval Rubric에 매핑
 MENTORING_RUBRIC = [
     Rubric(
         score_range=(0, 2),
-        expected_outcome="D등급: 필수 조건 미달. 실행성/전문성이 결여된 답변.",
+        expected_outcome="D등급 (0-2/10점): 필수 조건 미달. 실행가능성/전문성이 결여된 답변. 추상적이고 실행 불가능.",
     ),
     Rubric(
-        score_range=(3, 5),
-        expected_outcome="C등급: 조언은 있으나 추상적이며 멘티 상황 고려가 부족함.",
+        score_range=(3, 4),
+        expected_outcome="C등급 (3-4/10점): 조언은 있으나 추상적이며 멘티 상황 고려가 부족함. 일반적인 지식 수준.",
     ),
     Rubric(
-        score_range=(6, 8),
-        expected_outcome="B등급: 우수함. 구체적 단계와 실무 지식이 포함된 수준 높은 답변.",
+        score_range=(5, 6),
+        expected_outcome="B등급 (5-6/10점): 양호함. 구체적 단계와 실무 지식이 일부 포함. 실행 가능한 방향성 제시.",
+    ),
+    Rubric(
+        score_range=(7, 8),
+        expected_outcome="A등급 (7-8/10점): 우수함. 구체적 단계, 실무 지식, 멘티 맥락 고려가 잘 되어있음. 높은 수준의 답변.",
     ),
     Rubric(
         score_range=(9, 10),
-        expected_outcome="A등급: 완벽함. 수치/도구/단계 및 리스크 관리까지 포함된 최상위 답변.",
+        expected_outcome="S등급 (9-10/10점): 완벽함. 수치/도구/단계, 실무 경험 기반 인사이트, 리스크 관리, 멘티 상황 완벽 고려.",
     ),
 ]
 
@@ -230,13 +303,15 @@ QUALITY_METRIC = GEval(
         LLMTestCaseParams.CONTEXT,
     ],
     evaluation_steps=[
-        "1. 에이전트들이 분석한 실행가능성, 전문성, 현실성 점수를 개별적으로 확인한다.",
-        "2. 리포트의 결론이 우리가 설정한 Rubric 구간 중 어디에 해당하는지 대조한다.",
-        "3. 에이전트 간의 갈등이 어떻게 조정되었는지 보고 최종 점수의 타당성을 검토한다.",
-        "4. 최종 점수를 확정하고 그 근거를 한 문장으로 요약한다.",
+        "1. Context에 포함된 quality_consensus 에이전트의 종합 평가를 확인한다. final_evaluation의 breakdown(actionability, expertise, context_fit) 점수를 각각 검토한다.",
+        "2. 각 항목의 점수 범위를 확인한다: actionability(0-4점), expertise(0-4점), context_fit(0-2점), 총점 10점 만점.",
+        "3. 과락 조건을 확인한다: actionability 또는 expertise가 1점 이하인 경우 최대 C등급으로 제한한다.",
+        "4. 총점(10점 만점)을 Rubric 구간에 매핑한다: D(0-2), C(3-4), B(5-6), A(7-8), S(9-10)",
+        "5. 멘토 답변이 질문에 얼마나 구체적이고 실행 가능하며 전문적인지, 멘티 상황을 고려했는지 종합 평가하여 최종 점수를 0-10점 범위로 확정한다.",
+        "6. 점수 결정 근거를 1-2문장으로 명확하게 요약한다.",
     ],
     rubric=MENTORING_RUBRIC,
-    threshold=0.7,
+    threshold=0.5,  # 10점 만점에서 5점 이상이면 합격 (B등급 이상)
     model=deepeval_gemini_model,
 )
 
@@ -248,6 +323,122 @@ _evaluation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EVALUATIONS)
 _agent_executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
 
 
+# ==================== JSON Parsing Utilities ====================
+
+
+def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
+    """텍스트에서 JSON을 추출하는 유틸리티 함수
+
+    에이전트 응답에서 JSON 블록을 찾아 파싱합니다.
+    마크다운 코드 블록이나 일반 텍스트에서 JSON을 추출할 수 있습니다.
+
+    Args:
+        text: 파싱할 텍스트
+
+    Returns:
+        Dict[str, Any]: 파싱된 JSON 객체 또는 None (실패 시)
+    """
+    if not text:
+        return None
+
+    # JSON 블록 찾기 패턴들
+    patterns = [
+        # 마크다운 코드 블록: ```json ... ```
+        (r"```json\s*\n?(.*?)\n?```", 1),
+        # 일반 코드 블록: ``` ... ```
+        (r"```\s*\n?(.*?)\n?```", 1),
+        # JSON 객체 직접 매칭: { ... }
+        (r"(\{.*\})", 0),
+    ]
+
+    import re
+
+    for pattern, group_idx in patterns:
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            try:
+                json_str = match.group(group_idx if group_idx > 0 else 0)
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                continue
+
+    # 패턴 매칭 실패 시 전체 텍스트를 JSON으로 파싱 시도
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError:
+        return None
+
+
+def parse_agent_response(response_text: str, agent_name: str) -> Dict[str, Any]:
+    """에이전트 응답을 파싱하여 구조화된 데이터로 변환
+
+    각 에이전트의 JSON 응답을 파싱하고, 파싱 실패 시 기본값을 반환합니다.
+
+    Args:
+        response_text: 에이전트의 원본 응답 텍스트
+        agent_name: 에이전트 이름 (action_master, pro_proof, context_guardian, quality_consensus)
+
+    Returns:
+        Dict[str, Any]: 파싱된 응답 데이터
+            - action_master, pro_proof, context_guardian: {category, score, reasoning}
+            - quality_consensus: {final_evaluation, essential_condition_met, summary_feedback, integrated_improvement}
+    """
+    parsed_json = extract_json_from_text(response_text)
+
+    if agent_name == "quality_consensus":
+        # quality_consensus는 다른 JSON 구조를 사용
+        if parsed_json:
+            logger.info(f"Successfully parsed JSON from {agent_name}")
+            return {
+                "final_evaluation": parsed_json.get("final_evaluation", {}),
+                "essential_condition_met": parsed_json.get(
+                    "essential_condition_met", True
+                ),
+                "summary_feedback": parsed_json.get("summary_feedback", ""),
+                "integrated_improvement": parsed_json.get("integrated_improvement", ""),
+                "raw_response": response_text,
+            }
+        else:
+            # 파싱 실패 시 기본값 반환
+            logger.warning(
+                f"Failed to parse JSON from {agent_name}, using default values"
+            )
+            return {
+                "final_evaluation": {
+                    "grade": "C",
+                    "total_score": 6,
+                    "breakdown": {"actionability": 2, "expertise": 2, "context_fit": 2},
+                },
+                "essential_condition_met": False,
+                "summary_feedback": "JSON 파싱 실패",
+                "integrated_improvement": "응답 형식 오류로 평가 불가",
+                "raw_response": response_text,
+            }
+    else:
+        # action_master, pro_proof, context_guardian
+        if parsed_json:
+            logger.info(
+                f"Successfully parsed JSON from {agent_name}: score={parsed_json.get('score', 0)}"
+            )
+            return {
+                "category": parsed_json.get("category", "알 수 없음"),
+                "score": parsed_json.get("score", 0),
+                "reasoning": parsed_json.get("reasoning", ""),
+                "raw_response": response_text,
+            }
+        else:
+            # 파싱 실패 시 기본값 반환
+            logger.warning(
+                f"Failed to parse JSON from {agent_name}, using default values"
+            )
+            return {
+                "category": "알 수 없음",
+                "score": 0,
+                "reasoning": "JSON 파싱 실패",
+                "raw_response": response_text,
+            }
+
+
 def _extract_agent_response(node) -> Dict[str, Any]:
     """에이전트 노드에서 응답 정보를 추출하는 헬퍼 함수
 
@@ -255,7 +446,7 @@ def _extract_agent_response(node) -> Dict[str, Any]:
         node: 그래프 실행 결과의 노드 객체
 
     Returns:
-        Dict[str, Any]: agent_name, response_text, execution_time, token_usage를 포함한 딕셔너리
+        Dict[str, Any]: agent_name, response_text, parsed_data, execution_time, token_usage를 포함한 딕셔너리
     """
     node_id = node.node_id
     text = "(응답 없음)"
@@ -272,9 +463,13 @@ def _extract_agent_response(node) -> Dict[str, Any]:
         execution_time = node.result.execution_time / 1000  # ms -> s 변환
         usage = getattr(node.result, "accumulated_usage", {})
 
+    # JSON 파싱 추가
+    parsed_data = parse_agent_response(text, node_id)
+
     return {
         "agent_name": node_id,
         "response_text": text,
+        "parsed_data": parsed_data,
         "execution_time": execution_time,
         "token_usage": usage,
     }
@@ -328,28 +523,47 @@ def run_multi_agent_evaluation(question: str, answer: str) -> Dict[str, Any]:
     }
 
 
-def calculate_grade(score: float) -> str:
-    """0-10 스케일 점수를 D/C/B/A/S 등급으로 변환
+def calculate_grade(score: float, agent_data: Optional[Dict[str, Any]] = None) -> str:
+    """DeepEval 점수 (0-10)를 D/C/B/A/S 등급으로 변환
+
+    quality_consensus 에이전트의 과락 규칙 적용:
+    - [실행가능성] 또는 [전문성]이 1점 이하일 경우 최대 C등급으로 제한
 
     Args:
-        score: DeepEval에서 반환된 점수 (0-1 범위)
+        score: DeepEval에서 반환된 점수 (0-10 범위)
+        agent_data: quality_consensus의 파싱된 데이터 (optional)
 
     Returns:
         str: D, C, B, A, S 중 하나의 등급
     """
-    # DeepEval의 score는 0-1 범위이므로 10을 곱해서 0-10 스케일로 변환
-    absolute_score = score * 10
+    # DeepEval의 score는 0-10 범위
+    absolute_score = score
 
+    # 기본 등급 산정 (10점 만점 체계)
+    # D: 0-2, C: 3-4, B: 5-6, A: 7-8, S: 9-10
     if absolute_score >= 9:
-        return "S"
-    elif absolute_score >= 8:
-        return "A"
-    elif absolute_score >= 6:
-        return "B"
+        base_grade = "S"
+    elif absolute_score >= 7:
+        base_grade = "A"
+    elif absolute_score >= 5:
+        base_grade = "B"
     elif absolute_score >= 3:
-        return "C"
+        base_grade = "C"
     else:
-        return "D"
+        base_grade = "D"
+
+    # 과락 규칙 적용 (quality_consensus 데이터가 있는 경우)
+    if agent_data and "final_evaluation" in agent_data:
+        breakdown = agent_data["final_evaluation"].get("breakdown", {})
+        actionability = breakdown.get("actionability", 4)
+        expertise = breakdown.get("expertise", 4)
+
+        # 실행가능성 또는 전문성이 1점 이하면 C등급으로 제한
+        if actionability <= 1 or expertise <= 1:
+            if base_grade in ["S", "A", "B"]:
+                return "C"
+
+    return base_grade
 
 
 # ==================== Phase 2: 비동기 평가 함수 ====================
@@ -380,7 +594,7 @@ async def run_multi_agent_evaluation_async(
 
 
 async def run_rubric_evaluation_async(
-    question: str, answer: str, agent_consensus: str
+    question: str, answer: str, agent_consensus_data: Dict[str, Any]
 ) -> Dict[str, Any]:
     """DeepEval의 Rubric 기반 평가를 비동기로 실행 (Phase 2)
 
@@ -390,16 +604,43 @@ async def run_rubric_evaluation_async(
     Args:
         question: 멘티의 질문
         answer: 멘토의 답변
-        agent_consensus: 멀티 에이전트의 최종 합의 리포트
+        agent_consensus_data: quality_consensus 에이전트의 파싱된 데이터 (JSON 구조)
 
     Returns:
         Dict[str, Any]: 점수, 합격 여부, 평가 이유, 비용 등을 포함한 딕셔너리
     """
+    # quality_consensus 데이터를 명확한 컨텍스트로 포맷팅
+    final_eval = agent_consensus_data.get("final_evaluation", {})
+    breakdown = final_eval.get("breakdown", {})
+
+    # GEval이 이해하기 쉬운 형태로 컨텍스트 구성
+    context_text = f"""
+멀티 에이전트 평가 결과:
+
+[최종 등급 및 총점]
+- 등급: {final_eval.get('grade', 'N/A')}
+- 총점: {final_eval.get('total_score', 0)}/10점
+
+[세부 점수 breakdown]
+- 실행가능성 (Actionability): {breakdown.get('actionability', 0)}/4점
+- 전문성 (Expertise): {breakdown.get('expertise', 0)}/4점
+- 현실성 (Context Fit): {breakdown.get('context_fit', 0)}/2점
+
+[필수 조건 충족 여부]
+- Essential Condition Met: {agent_consensus_data.get('essential_condition_met', True)}
+
+[종합 평가]
+{agent_consensus_data.get('summary_feedback', '')}
+
+[개선 제안]
+{agent_consensus_data.get('integrated_improvement', '')}
+"""
+
     # 테스트 케이스 생성
     test_case = LLMTestCase(
         input=question,
         actual_output=answer,
-        context=[agent_consensus],
+        context=[context_text.strip()],
     )
 
     # DeepEval의 비동기 메서드 사용
@@ -453,18 +694,41 @@ async def process_single_test_case(
             test_case.actual_output,
         )
 
-        # Step 2: Rubric 평가 (Phase 2 비동기 함수 사용)
+        # Step 2: quality_consensus 파싱된 데이터 추출
+        quality_consensus_data = None
+        for agent_resp in agent_evaluation["agent_responses"]:
+            if agent_resp["agent_name"] == "quality_consensus":
+                quality_consensus_data = agent_resp.get("parsed_data")
+                break
+
+        # 파싱 실패 시 기본값 사용
+        if not quality_consensus_data:
+            quality_consensus_data = {
+                "final_evaluation": {
+                    "grade": "C",
+                    "total_score": 5,
+                    "breakdown": {"actionability": 2, "expertise": 2, "context_fit": 1},
+                },
+                "essential_condition_met": False,
+                "summary_feedback": "JSON 파싱 실패",
+                "integrated_improvement": "응답 형식 오류로 평가 불가",
+            }
+
+        # Step 3: Rubric 평가 (파싱된 데이터 전달)
         rubric_evaluation = await run_rubric_evaluation_async(
             test_case.input,
             test_case.actual_output,
-            agent_evaluation["final_consensus"],
+            quality_consensus_data,
         )
 
-        # Step 3: 등급 산정
-        grade = calculate_grade(rubric_evaluation["score"])
-        absolute_score = rubric_evaluation["score"] * 10
+        # Step 4: 등급 산정 (quality_consensus 데이터를 활용한 과락 규칙 적용)
+        # DeepEval의 score는 0-1 범위이므로 10을 곱해서 0-10 범위로 변환
+        normalized_score = rubric_evaluation["score"]  # 0-1 범위
+        absolute_score = normalized_score * 10  # 0-10 범위로 변환
 
-        # Step 4: 응답 구성
+        grade = calculate_grade(absolute_score, quality_consensus_data)
+
+        # Step 5: 응답 구성
         test_result = TestResultResponse(
             test_case_index=index,
             input=test_case.input,
@@ -478,7 +742,7 @@ async def process_single_test_case(
             final_consensus=agent_evaluation["final_consensus"],
             # Rubric 평가 결과 구성
             rubric_evaluation=RubricEvaluationDetail(
-                score=rubric_evaluation["score"],
+                score=normalized_score,
                 absolute_score=absolute_score,
                 grade=grade,
                 threshold=rubric_evaluation["threshold"],
@@ -521,17 +785,20 @@ class AgentResponseDetail(BaseModel):
 
     agent_name: str  # 에이전트 이름
     response_text: str  # 에이전트 응답 텍스트
+    parsed_data: Dict[str, Any]  # 파싱된 JSON 데이터 (category, score, reasoning 등)
     execution_time: float  # 실행 시간 (초)
-    token_usage: Dict[str, int]  # 토큰 사용량 (totalTokens, inputTokens, outputTokens 등)
+    token_usage: Dict[
+        str, int
+    ]  # 토큰 사용량 (totalTokens, inputTokens, outputTokens 등)
 
 
 class RubricEvaluationDetail(BaseModel):
     """Rubric 기반 평가 상세 정보"""
 
-    score: float  # 0-1 스케일 점수
-    absolute_score: float  # 0-10 스케일 점수
+    score: float  # 정규화 점수 (0-1 범위, DeepEval 원본 점수)
+    absolute_score: float  # 절대 점수 (0-10 범위, score × 10)
     grade: str  # D, C, B, A, S 등급
-    threshold: float  # 합격 기준점
+    threshold: float  # 합격 기준점 (0-1 범위, 0.5 = 5점/10점)
     success: bool  # 합격 여부
     reason: str  # 평가 이유 (한글)
     reason_en: str  # 평가 이유 (영문 원본)
@@ -636,9 +903,7 @@ async def evaluate_test_cases(request: EvaluationRequest):
     """
 
     # 모든 테스트 케이스를 병렬 처리
-    tasks = [
-        process_single_test_case(tc, i) for i, tc in enumerate(request.test_cases)
-    ]
+    tasks = [process_single_test_case(tc, i) for i, tc in enumerate(request.test_cases)]
 
     # 병렬 실행 (일부 실패해도 계속 진행)
     results = await asyncio.gather(*tasks, return_exceptions=True)
