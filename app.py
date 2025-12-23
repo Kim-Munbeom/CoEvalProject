@@ -9,10 +9,11 @@ st.set_page_config(
 )
 
 # 타이틀
-st.title("📊 CoEval - 답변 평가 시스템")
+st.title("📊 CoEval - 멘토링 답변 평가 시스템")
 st.markdown(
-    "AI 답변의 품질을 **멀티 에이전트 시스템**으로 평가하여 **0-10점 스케일**과 **등급(D/C/B/A/S)**을 제공합니다."
+    "멘토링 답변을 **3개 영역 전문 에이전트**가 평가하여 **0-10점 스케일**과 **등급(D/C/B/A/S)**을 제공합니다."
 )
+st.caption("🎯 실행성 | 🔬 전문성 | 🌍 현실성 → 📊 종합 평가")
 
 # API 엔드포인트 설정
 API_URL = "http://localhost:8000/evaluate"
@@ -23,18 +24,28 @@ with st.sidebar:
     api_url = st.text_input("API URL", value=API_URL)
     st.markdown("---")
     st.markdown("### 평가 시스템")
-    st.markdown("**4개 에이전트 구성:**")
-    st.markdown("- 🎯 **Action Master**: 실행 지침 검수")
-    st.markdown("- 🔬 **Pro Proof**: 실무 디테일 검증")
-    st.markdown("- 🌍 **Context Guardian**: 현실성 분석")
-    st.markdown("- 📊 **Quality Consensus**: 최종 종합 조정")
+    st.markdown("**4개 전문 에이전트 구성:**")
+    st.markdown("- 🎯 **Action Master**: 실행성 전문가")
+    st.markdown("  - 구체적 수치, 도구명, 단계별 지침 평가")
+    st.markdown("- 🔬 **Pro Proof**: 전문성 검증자")
+    st.markdown("  - 현업 지식 vs 검색 지식 판별")
+    st.markdown("- 🌍 **Context Guardian**: 현실성 감시자")
+    st.markdown("  - 멘티 상황별 실현 가능성 검토")
+    st.markdown("- 📊 **Quality Consensus**: 최종 조정자")
+    st.markdown("  - 3개 영역 점수 종합 및 조정")
     st.markdown("---")
     st.markdown("### 등급 체계")
-    st.markdown("- **S등급 (9-10점)**: 완벽한 답변")
-    st.markdown("- **A등급 (8-9점)**: 우수한 답변")
-    st.markdown("- **B등급 (6-8점)**: 양호한 답변")
-    st.markdown("- **C등급 (3-6점)**: 부족한 답변")
-    st.markdown("- **D등급 (0-3점)**: 미달 답변")
+    st.markdown("**3개 영역 종합 평가:**")
+    st.markdown("- **S등급 (9-10점)**: 완벽")
+    st.markdown("  - 실행성·전문성·현실성 모두 우수")
+    st.markdown("- **A등급 (8-9점)**: 우수")
+    st.markdown("  - 수치/도구/단계 + 리스크 관리")
+    st.markdown("- **B등급 (6-8점)**: 양호")
+    st.markdown("  - 구체적 단계 + 실무 지식 포함")
+    st.markdown("- **C등급 (3-6점)**: 부족")
+    st.markdown("  - 추상적, 멘티 상황 고려 부족")
+    st.markdown("- **D등급 (0-3점)**: 미달")
+    st.markdown("  - 필수 조건 결여 (실행성/전문성)")
 
 # 메인 컨텐츠
 st.header("📝 평가할 답변 입력")
@@ -165,10 +176,10 @@ if st.button("🔍 평가 시작", type="primary", use_container_width=True):
                     }
 
                     agent_names = {
-                        "action_master": "Action Master (실행 지침 검수)",
-                        "pro_proof": "Pro Proof (실무 디테일 검증)",
-                        "context_guardian": "Context Guardian (현실성 분석)",
-                        "quality_consensus": "Quality Consensus (최종 종합 조정)"
+                        "action_master": "Action Master (실행성 전문가)",
+                        "pro_proof": "Pro Proof (전문성 검증자)",
+                        "context_guardian": "Context Guardian (현실성 감시자)",
+                        "quality_consensus": "Quality Consensus (최종 조정자)"
                     }
 
                     for agent in test_result["agent_responses"]:
