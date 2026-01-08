@@ -10,6 +10,8 @@ CoEval은 **멀티 에이전트 시스템**을 활용하여 AI 멘토링 답변�
 - **🌐 자동 번역**: 평가 결과를 자동으로 한글로 번역
 - **💻 웹 UI**: Streamlit 기반의 사용자 친화적 인터페이스
 - **🚀 REST API**: FastAPI 기반의 평가 API 엔드포인트
+- **💾 데이터베이스**: SQLModel + SQLite로 평가 결과 영구 저장 및 조회
+- **📈 통계 분석**: 등급 분포, 평균 점수, 합격률 등 통계 제공
 - **📋 샘플 데이터**: 좋은 답변과 나쁜 답변 예시 제공
 
 ## 시스템 구성
@@ -17,6 +19,7 @@ CoEval은 **멀티 에이전트 시스템**을 활용하여 AI 멘토링 답변�
 - **백엔드 (co_eval.py)**: FastAPI 기반 REST API 서버
 - **프론트엔드 (app.py)**: Streamlit 기반 웹 UI
 - **평가 엔진**: Strands 멀티 에이전트 + DeepEval Rubric
+- **데이터베이스**: SQLModel + SQLite (평가 이력 저장 및 통계 분석)
 
 ## 멀티 에이전트 평가 시스템
 
@@ -109,7 +112,7 @@ uv sync
 ```bash
 pip install -r requirements.txt
 # 또는
-pip install deepeval fastapi[standard] google-genai httpx streamlit
+pip install deepeval fastapi[standard] google-genai httpx streamlit sqlmodel
 ```
 
 ### 3. 환경 변수 설정
@@ -118,9 +121,11 @@ pip install deepeval fastapi[standard] google-genai httpx streamlit
 
 ```env
 GEMINI_API_KEY=your_gemini_api_key_here
+DATABASE_URL=sqlite:///./coeval.db  # 선택사항, 기본값 사용 가능
 ```
 
-Google AI Studio에서 API 키를 발급받을 수 있습니다: https://aistudio.google.com/app/apikey
+- **GEMINI_API_KEY**: Google AI Studio에서 API 키 발급 (https://aistudio.google.com/app/apikey)
+- **DATABASE_URL**: SQLite 데이터베이스 파일 경로 (선택사항, 기본값: `sqlite:///./coeval.db`)
 
 ## 사용 방법
 
@@ -160,14 +165,18 @@ uv run streamlit run app.py
 
 ## API 사용 예제
 
-### 평가 API 호출
+### 1. 평가 API 호출 (데이터베이스 자동 저장)
 
 **엔드포인트**: `POST /evaluate`
+
+**새로운 파라미터**:
+- `save_to_db`: 평가 결과를 데이터베이스에 저장할지 여부 (기본값: `true`)
 
 **요청 예제**:
 
 ```bash
-curl -X POST "http://localhost:8000/evaluate" \
+# 평가 결과를 데이터베이스에 자동 저장 (기본값)
+curl -X POST "http://localhost:8000/evaluate?save_to_db=true" \
   -H "Content-Type: application/json" \
   -d '{
     "test_cases": [
@@ -178,6 +187,11 @@ curl -X POST "http://localhost:8000/evaluate" \
       }
     ]
   }'
+
+# 데이터베이스 저장 없이 평가만 실행
+curl -X POST "http://localhost:8000/evaluate?save_to_db=false" \
+  -H "Content-Type: application/json" \
+  -d '{...}'
 ```
 
 **응답 예제**:
@@ -245,7 +259,7 @@ curl -X POST "http://localhost:8000/evaluate" \
 }
 ```
 
-### Python으로 API 호출
+### 2. Python으로 API 호출
 
 ```python
 import httpx
@@ -267,17 +281,93 @@ with httpx.Client() as client:
     print(result)
 ```
 
+### 3. 데이터베이스 조회 API
+
+#### 저장된 평가 조회
+
+```bash
+# 특정 평가 조회 (ID로)
+curl -X GET "http://localhost:8000/evaluations/1"
+
+# 평가 목록 조회 (페이지네이션)
+curl -X GET "http://localhost:8000/evaluations?skip=0&limit=10"
+
+# S등급 평가만 조회
+curl -X GET "http://localhost:8000/evaluations?grade=S&limit=10"
+
+# 점수 범위로 조회 (7점 이상, A등급 이상)
+curl -X GET "http://localhost:8000/evaluations/score-range?min_score=7.0&max_score=10.0"
+```
+
+#### 평가 통계 조회
+
+```bash
+# 전체 평가 통계 (총 개수, 등급 분포, 평균 점수, 합격률)
+curl -X GET "http://localhost:8000/statistics"
+```
+
+**응답 예제**:
+```json
+{
+  "total_evaluations": 150,
+  "grade_distribution": {
+    "S": 20,
+    "A": 40,
+    "B": 50,
+    "C": 30,
+    "D": 10
+  },
+  "average_score": 6.5,
+  "success_rate": 73.3
+}
+```
+
+#### 평가 삭제
+
+```bash
+# 특정 평가 삭제
+curl -X DELETE "http://localhost:8000/evaluations/1"
+```
+
+### 4. Python에서 데이터베이스 직접 사용
+
+```python
+from sqlmodel import Session
+from co_eval import engine, get_all_evaluations, get_evaluations_by_score_range
+
+with Session(engine) as session:
+    # 모든 평가 조회
+    all_evaluations = get_all_evaluations(session, skip=0, limit=100)
+
+    # S등급 평가만 조회
+    s_grade_evaluations = get_all_evaluations(session, grade="S")
+
+    # 고득점 평가 조회 (7점 이상)
+    high_scores = get_evaluations_by_score_range(session, 7.0, 10.0)
+
+    # 결과 출력
+    for eval in s_grade_evaluations:
+        print(f"[{eval.grade}] {eval.total_score}/10 - {eval.mentee_question[:50]}...")
+```
+
+자세한 데이터베이스 사용법은 [`DATABASE_USAGE.md`](DATABASE_USAGE.md) 문서를 참고하세요.
+
 ## 프로젝트 구조
 
 ```
 CoEval/
-├── co_eval.py          # FastAPI 백엔드 서버
-├── app.py              # Streamlit 웹 UI
-├── sample_data.py      # 샘플 데이터 (좋은/나쁜 답변 예시)
-├── pyproject.toml      # 프로젝트 설정 및 의존성
-├── uv.lock            # uv 잠금 파일
-├── .env               # 환경 변수 (API 키)
-└── readme.md          # 프로젝트 문서
+├── co_eval.py                  # FastAPI 백엔드 서버 (멀티 에이전트 + DB)
+├── app.py                      # Streamlit 웹 UI
+├── sample_data.py              # 샘플 데이터 (좋은/나쁜 답변 예시)
+├── test_database.py            # 데이터베이스 기능 테스트 스크립트
+├── example_database_usage.py   # 데이터베이스 사용 예시 (10가지)
+├── DATABASE_USAGE.md           # 데이터베이스 완전 가이드
+├── IMPLEMENTATION_SUMMARY.md   # SQLModel 구현 요약
+├── pyproject.toml              # 프로젝트 설정 및 의존성
+├── uv.lock                     # uv 잠금 파일
+├── .env                        # 환경 변수 (API 키, DB URL)
+├── coeval.db                   # SQLite 데이터베이스 (자동 생성)
+└── README.md                   # 프로젝트 문서
 ```
 
 ## 개발 환경
@@ -290,6 +380,8 @@ CoEval/
   - **Strands Agents**: 멀티 에이전트 시스템 프레임워크
   - **DeepEval**: LLM 평가 및 Rubric 프레임워크
   - **Google GenAI**: Google Gemini API 클라이언트
+  - **SQLModel**: SQL 데이터베이스 ORM (FastAPI 완벽 통합)
+  - **SQLite**: 파일 기반 경량 데이터베이스
   - **httpx**: HTTP 클라이언트
 
 ## 기술 스택
@@ -300,11 +392,18 @@ CoEval/
 - **LLM**: Google Gemini 2.5 Flash
 - **번역**: Google Gemini 2.5 Flash Lite
 - **API**: FastAPI + Pydantic
+- **데이터베이스**: SQLModel + SQLite (평가 결과 영구 저장)
 
 ### 프론트엔드 (app.py)
 - **UI 프레임워크**: Streamlit
 - **HTTP 클라이언트**: httpx
 - **결과 시각화**: 등급 배지, 프로그레스 바, 메트릭 카드
+
+### 데이터베이스
+- **ORM**: SQLModel (타입 안전성, FastAPI 완벽 통합)
+- **DB 엔진**: SQLite (파일 기반, 별도 서버 불필요)
+- **기능**: CRUD 작업, 페이지네이션, 필터링, 통계 분석
+- **확장성**: PostgreSQL, MySQL 등으로 쉽게 전환 가능
 
 ## 성능 및 비용
 
@@ -324,6 +423,40 @@ CoEval/
 - **총합**: ~6,000 토큰 (~$0.0045)
 
 *가격은 Gemini 2.5 Flash 기준 (2025년 1월)*
+
+## 데이터베이스 기능
+
+### 자동 저장
+- `/evaluate` 엔드포인트 호출 시 평가 결과가 자동으로 데이터베이스에 저장됨
+- `save_to_db=false` 파라미터로 저장 비활성화 가능
+
+### 저장되는 데이터
+- **입력 데이터**: 멘티 질문, 멘토 답변
+- **평가 결과**: 등급 (S/A/B/C/D), 총점 (0-10)
+- **세부 점수**: 실행가능성 (0-4), 전문성 (0-4), 현실성 (0-2)
+- **피드백**: 종합 피드백, 개선 제안, 평가 이유 (한글/영문)
+- **메타데이터**: 실행 시간, 토큰 사용량, 평가 비용, 생성 시간
+
+### 조회 기능
+- **ID로 조회**: 특정 평가 결과 상세 조회
+- **목록 조회**: 페이지네이션 지원 (skip, limit)
+- **필터링**: 등급별 필터 (S, A, B, C, D)
+- **범위 검색**: 점수 범위로 평가 검색 (예: 7-10점)
+- **통계 분석**: 총 개수, 등급 분포, 평균 점수, 합격률
+
+### API 엔드포인트
+- `GET /evaluations/{id}` - 특정 평가 조회
+- `GET /evaluations` - 평가 목록 조회 (페이지네이션, 필터링)
+- `GET /evaluations/score-range` - 점수 범위로 조회
+- `GET /statistics` - 평가 통계
+- `DELETE /evaluations/{id}` - 평가 삭제
+
+### 데이터베이스 파일
+- **위치**: `./coeval.db` (프로젝트 루트)
+- **백업**: `cp coeval.db coeval_backup.db`
+- **초기화**: `rm coeval.db` (앱 재시작 시 자동 재생성)
+
+자세한 내용은 [`DATABASE_USAGE.md`](DATABASE_USAGE.md) 문서를 참고하세요.
 
 ## 문제 해결
 
@@ -364,6 +497,19 @@ uv run python -c "import co_eval; print('✅ 임포트 성공')"
 - 그래프 사이클 경고는 무시 가능 (현재 DAG 구조는 사이클이 없음)
 
 ## 변경 이력
+
+### v0.3.0 (2025-01-08)
+- 💾 **SQLModel + SQLite 데이터베이스 통합**
+  - 평가 결과 영구 저장 기능 추가
+  - 5개 CRUD 함수 구현 (저장, 조회, 목록, 범위 검색, 삭제)
+  - 5개 새로운 REST API 엔드포인트
+  - 통계 분석 기능 (등급 분포, 평균 점수, 합격률)
+  - 페이지네이션 및 필터링 지원
+- 📚 완전한 데이터베이스 문서화
+  - `DATABASE_USAGE.md`: 완전한 사용 가이드
+  - `IMPLEMENTATION_SUMMARY.md`: 구현 요약
+  - `test_database.py`: 8개 테스트 시나리오
+  - `example_database_usage.py`: 10개 사용 예시
 
 ### v0.2.0 (2025-01-XX)
 - ✨ 멀티 에이전트 평가 시스템 도입

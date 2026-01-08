@@ -29,6 +29,7 @@ import concurrent.futures
 import json
 import logging
 import os
+from datetime import datetime
 from typing import List, Optional, Dict, Any
 
 from deepeval.metrics import GEval
@@ -36,9 +37,10 @@ from deepeval.metrics.g_eval import Rubric
 from deepeval.models import GeminiModel as DeepEvalGeminiModel
 from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from google import genai
 from pydantic import BaseModel
+from sqlmodel import Field, Session, SQLModel, create_engine, select
 from strands import Agent
 from strands.models.gemini import GeminiModel as StrandsGeminiModel
 from strands.multiagent import GraphBuilder
@@ -54,6 +56,14 @@ logger = logging.getLogger(__name__)
 
 # FastAPI 애플리케이션 인스턴스 생성
 app = FastAPI()
+
+
+# 애플리케이션 시작 시 데이터베이스 초기화
+@app.on_event("startup")
+def on_startup():
+    """애플리케이션 시작 시 데이터베이스 테이블 생성"""
+    create_db_and_tables()
+    logger.info("Database tables created successfully")
 
 # Strands용 Gemini 모델 (멀티 에이전트용)
 # 멀티 에이전트 시스템에서 각 에이전트가 사용할 LLM 모델
@@ -80,6 +90,243 @@ deepeval_gemini_model = DeepEvalGeminiModel(
 # Google GenAI 클라이언트 초기화 (번역용)
 # DeepEval의 영문 평가 이유를 한글로 번역하기 위해 사용
 genai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+
+# ==================== SQLModel 데이터베이스 모델 ====================
+
+
+class EvaluationRecord(SQLModel, table=True):
+    """평가 결과를 저장하는 SQLModel 테이블
+
+    멘토링 답변 평가 결과를 데이터베이스에 영구 저장합니다.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    # 입력 데이터
+    mentee_question_title: str = Field(index=True)
+    mentee_question_content: str
+    mentor_answer: str
+    expected_output: Optional[str] = None
+
+    # 평가 결과
+    grade: str  # S, A, B, C, D
+    total_score: float  # 0-10 범위
+    normalized_score: float  # 0-1 범위 (DeepEval 원본)
+
+    # 세부 점수
+    actionability_score: int  # 0-4
+    expertise_score: int  # 0-4
+    context_fit_score: int  # 0-2
+
+    # 평가 피드백
+    summary_feedback: str
+    improvement_suggestion: str
+    evaluation_reason_kr: str
+    evaluation_reason_en: str
+
+    # 필수 조건 충족 여부
+    essential_condition_met: bool
+
+    # 합격 여부
+    success: bool
+
+    # 실행 정보
+    total_execution_time: float
+    total_tokens: int
+    evaluation_cost: float
+
+    # 원본 데이터 (JSON)
+    agent_responses_json: str  # JSON string으로 저장
+    final_consensus: str
+
+
+# ==================== 데이터베이스 설정 ====================
+
+# SQLite 데이터베이스 파일 경로
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./coeval.db")
+
+# 데이터베이스 엔진 생성
+engine = create_engine(DATABASE_URL, echo=False)
+
+
+def create_db_and_tables():
+    """데이터베이스와 테이블을 생성하는 함수
+
+    애플리케이션 시작 시 한 번 호출하여 필요한 테이블을 생성합니다.
+    """
+    SQLModel.metadata.create_all(engine)
+
+
+def get_session():
+    """데이터베이스 세션을 생성하는 제너레이터 함수
+
+    FastAPI의 Depends와 함께 사용하여 세션 관리를 자동화할 수 있습니다.
+
+    Yields:
+        Session: SQLModel 세션 객체
+    """
+    with Session(engine) as session:
+        yield session
+
+
+# ==================== 데이터베이스 CRUD 함수 ====================
+
+
+def save_evaluation_to_db(
+    session: Session,
+    test_case: TestCaseRequest,
+    result: "TestResultResponse"
+) -> EvaluationRecord:
+    """평가 결과를 데이터베이스에 저장하는 함수
+
+    Args:
+        session: SQLModel 세션
+        test_case: 원본 테스트 케이스 요청
+        result: 평가 결과
+
+    Returns:
+        EvaluationRecord: 저장된 레코드
+    """
+    # quality_consensus 데이터 추출
+    quality_data = None
+    for agent_resp in result.agent_responses:
+        if agent_resp.agent_name == "quality_consensus":
+            quality_data = agent_resp.parsed_data
+            break
+
+    # 기본값 설정
+    if not quality_data:
+        quality_data = {
+            "final_evaluation": {
+                "grade": result.rubric_evaluation.grade,
+                "total_score": result.rubric_evaluation.absolute_score,
+                "breakdown": {"actionability": 0, "expertise": 0, "context_fit": 0}
+            },
+            "essential_condition_met": False,
+            "summary_feedback": "",
+            "integrated_improvement": ""
+        }
+
+    breakdown = quality_data.get("final_evaluation", {}).get("breakdown", {})
+
+    # EvaluationRecord 생성
+    record = EvaluationRecord(
+        mentee_question_title=test_case.input_title,
+        mentee_question_content=test_case.input_content,
+        mentor_answer=test_case.actual_output,
+        expected_output=test_case.expected_output,
+        grade=result.rubric_evaluation.grade,
+        total_score=result.rubric_evaluation.absolute_score,
+        normalized_score=result.rubric_evaluation.score,
+        actionability_score=breakdown.get("actionability", 0),
+        expertise_score=breakdown.get("expertise", 0),
+        context_fit_score=breakdown.get("context_fit", 0),
+        summary_feedback=quality_data.get("summary_feedback", ""),
+        improvement_suggestion=quality_data.get("integrated_improvement", ""),
+        evaluation_reason_kr=result.rubric_evaluation.reason,
+        evaluation_reason_en=result.rubric_evaluation.reason_en,
+        essential_condition_met=quality_data.get("essential_condition_met", True),
+        success=result.success,
+        total_execution_time=result.total_execution_time,
+        total_tokens=result.total_tokens,
+        evaluation_cost=result.rubric_evaluation.evaluation_cost,
+        agent_responses_json=json.dumps(
+            [resp.dict() for resp in result.agent_responses],
+            ensure_ascii=False
+        ),
+        final_consensus=result.final_consensus
+    )
+
+    session.add(record)
+    session.commit()
+    session.refresh(record)
+
+    return record
+
+
+def get_evaluation_by_id(session: Session, evaluation_id: int) -> Optional[EvaluationRecord]:
+    """ID로 평가 결과를 조회하는 함수
+
+    Args:
+        session: SQLModel 세션
+        evaluation_id: 평가 레코드 ID
+
+    Returns:
+        Optional[EvaluationRecord]: 조회된 레코드 (없으면 None)
+    """
+    return session.get(EvaluationRecord, evaluation_id)
+
+
+def get_all_evaluations(
+    session: Session,
+    skip: int = 0,
+    limit: int = 100,
+    grade: Optional[str] = None
+) -> List[EvaluationRecord]:
+    """모든 평가 결과를 조회하는 함수
+
+    Args:
+        session: SQLModel 세션
+        skip: 건너뛸 레코드 수 (페이지네이션)
+        limit: 최대 반환 레코드 수
+        grade: 등급 필터 (S, A, B, C, D 중 하나, 선택사항)
+
+    Returns:
+        List[EvaluationRecord]: 평가 레코드 리스트
+    """
+    statement = select(EvaluationRecord)
+
+    if grade:
+        statement = statement.where(EvaluationRecord.grade == grade)
+
+    statement = statement.offset(skip).limit(limit).order_by(EvaluationRecord.created_at.desc())
+
+    results = session.exec(statement)
+    return list(results.all())
+
+
+def get_evaluations_by_score_range(
+    session: Session,
+    min_score: float,
+    max_score: float
+) -> List[EvaluationRecord]:
+    """점수 범위로 평가 결과를 조회하는 함수
+
+    Args:
+        session: SQLModel 세션
+        min_score: 최소 점수 (0-10 범위)
+        max_score: 최대 점수 (0-10 범위)
+
+    Returns:
+        List[EvaluationRecord]: 평가 레코드 리스트
+    """
+    statement = select(EvaluationRecord).where(
+        EvaluationRecord.total_score >= min_score,
+        EvaluationRecord.total_score <= max_score
+    ).order_by(EvaluationRecord.total_score.desc())
+
+    results = session.exec(statement)
+    return list(results.all())
+
+
+def delete_evaluation(session: Session, evaluation_id: int) -> bool:
+    """평가 결과를 삭제하는 함수
+
+    Args:
+        session: SQLModel 세션
+        evaluation_id: 삭제할 평가 레코드 ID
+
+    Returns:
+        bool: 삭제 성공 여부
+    """
+    record = session.get(EvaluationRecord, evaluation_id)
+    if record:
+        session.delete(record)
+        session.commit()
+        return True
+    return False
 
 
 async def translate_to_korean_async(text: str) -> str:
@@ -475,14 +722,15 @@ def _extract_agent_response(node) -> Dict[str, Any]:
     }
 
 
-def run_multi_agent_evaluation(question: str, answer: str) -> Dict[str, Any]:
+def run_multi_agent_evaluation(question_title: str, question_content: str, answer: str) -> Dict[str, Any]:
     """멀티 에이전트 시스템을 실행하여 평가 결과를 반환
 
-    멘티의 질문과 멘토의 답변을 입력받아 4개 에이전트로 구성된
+    멘티의 질문(제목+내용)과 멘토의 답변을 입력받아 4개 에이전트로 구성된
     평가 파이프라인을 실행합니다.
 
     Args:
-        question: 멘티의 질문
+        question_title: 멘티의 질문 제목
+        question_content: 멘티의 질문 내용
         answer: 멘토의 답변
 
     Returns:
@@ -490,8 +738,11 @@ def run_multi_agent_evaluation(question: str, answer: str) -> Dict[str, Any]:
     """
 
     # 입력 포맷팅 (멘티 질문과 멘토 답변을 구조화된 형태로 변환)
-    evaluation_input = f"""[멘티 질문]
-{question}
+    evaluation_input = f"""[멘티 질문 제목]
+{question_title}
+
+[멘티 질문 내용]
+{question_content}
 
 [멘토 답변]
 {answer}"""
@@ -570,7 +821,7 @@ def calculate_grade(score: float, agent_data: Optional[Dict[str, Any]] = None) -
 
 
 async def run_multi_agent_evaluation_async(
-    question: str, answer: str
+    question_title: str, question_content: str, answer: str
 ) -> Dict[str, Any]:
     """멀티 에이전트 시스템을 비동기로 실행 (Phase 2)
 
@@ -578,7 +829,8 @@ async def run_multi_agent_evaluation_async(
     ThreadPoolExecutor를 사용하여 비동기로 래핑합니다.
 
     Args:
-        question: 멘티의 질문
+        question_title: 멘티의 질문 제목
+        question_content: 멘티의 질문 내용
         answer: 멘토의 답변
 
     Returns:
@@ -588,13 +840,14 @@ async def run_multi_agent_evaluation_async(
     return await loop.run_in_executor(
         _agent_executor,
         run_multi_agent_evaluation,
-        question,
+        question_title,
+        question_content,
         answer,
     )
 
 
 async def run_rubric_evaluation_async(
-    question: str, answer: str, agent_consensus_data: Dict[str, Any]
+    question_title: str, question_content: str, answer: str, agent_consensus_data: Dict[str, Any]
 ) -> Dict[str, Any]:
     """DeepEval의 Rubric 기반 평가를 비동기로 실행 (Phase 2)
 
@@ -602,7 +855,8 @@ async def run_rubric_evaluation_async(
     번역도 비동기로 처리합니다.
 
     Args:
-        question: 멘티의 질문
+        question_title: 멘티의 질문 제목
+        question_content: 멘티의 질문 내용
         answer: 멘토의 답변
         agent_consensus_data: quality_consensus 에이전트의 파싱된 데이터 (JSON 구조)
 
@@ -636,9 +890,9 @@ async def run_rubric_evaluation_async(
 {agent_consensus_data.get('integrated_improvement', '')}
 """
 
-    # 테스트 케이스 생성
+    # 테스트 케이스 생성 (제목과 내용을 결합)
     test_case = LLMTestCase(
-        input=question,
+        input=f"{question_title}\n\n{question_content}",
         actual_output=answer,
         context=[context_text.strip()],
     )
@@ -690,7 +944,8 @@ async def process_single_test_case(
     async with _evaluation_semaphore:
         # Step 1: 멀티 에이전트 평가 (Phase 2 비동기 함수 사용)
         agent_evaluation = await run_multi_agent_evaluation_async(
-            test_case.input,
+            test_case.input_title,
+            test_case.input_content,
             test_case.actual_output,
         )
 
@@ -716,7 +971,8 @@ async def process_single_test_case(
 
         # Step 3: Rubric 평가 (파싱된 데이터 전달)
         rubric_evaluation = await run_rubric_evaluation_async(
-            test_case.input,
+            test_case.input_title,
+            test_case.input_content,
             test_case.actual_output,
             quality_consensus_data,
         )
@@ -731,7 +987,8 @@ async def process_single_test_case(
         # Step 5: 응답 구성
         test_result = TestResultResponse(
             test_case_index=index,
-            input=test_case.input,
+            input_title=test_case.input_title,
+            input_content=test_case.input_content,
             actual_output=test_case.actual_output,
             expected_output=test_case.expected_output,
             # 각 에이전트의 응답을 Pydantic 모델로 변환
@@ -769,7 +1026,8 @@ async def process_single_test_case(
 class TestCaseRequest(BaseModel):
     """단일 테스트 케이스 요청 모델"""
 
-    input: str  # 멘티 질문
+    input_title: str  # 멘티 질문 제목
+    input_content: str  # 멘티 질문 내용
     actual_output: str  # 멘토 답변
     expected_output: Optional[str] = None  # 기대 답변 (선택사항, 현재 미사용)
 
@@ -810,7 +1068,8 @@ class TestResultResponse(BaseModel):
     """단일 테스트 케이스의 평가 결과"""
 
     test_case_index: int  # 테스트 케이스 인덱스
-    input: str  # 멘티 질문
+    input_title: str  # 멘티 질문 제목
+    input_content: str  # 멘티 질문 내용
     actual_output: str  # 멘토 답변
     expected_output: Optional[str]  # 기대 답변 (선택사항)
 
@@ -840,7 +1099,7 @@ class EvaluationResponse(BaseModel):
 
 
 @app.post("/evaluate", response_model=EvaluationResponse)
-async def evaluate_test_cases(request: EvaluationRequest):
+async def evaluate_test_cases(request: EvaluationRequest, save_to_db: bool = True):
     """멘토링 답변을 평가하는 메인 API 엔드포인트 (Phase 2: 비동기 최적화 버전)
 
     이 엔드포인트는 두 단계의 평가 프로세스를 수행합니다:
@@ -867,6 +1126,7 @@ async def evaluate_test_cases(request: EvaluationRequest):
 
     Args:
         request: 평가할 테스트 케이스들을 포함한 요청 객체
+        save_to_db: 평가 결과를 데이터베이스에 저장할지 여부 (기본값: True)
 
     Returns:
         EvaluationResponse: 각 테스트 케이스의 평가 결과를 포함한 응답 객체
@@ -915,7 +1175,8 @@ async def evaluate_test_cases(request: EvaluationRequest):
             # 에러 발생 시 에러 응답 생성
             error_result = TestResultResponse(
                 test_case_index=i,
-                input=request.test_cases[i].input,
+                input_title=request.test_cases[i].input_title,
+                input_content=request.test_cases[i].input_content,
                 actual_output=request.test_cases[i].actual_output,
                 expected_output=request.test_cases[i].expected_output,
                 agent_responses=[],
@@ -940,6 +1201,17 @@ async def evaluate_test_cases(request: EvaluationRequest):
         else:
             processed_results.append(result)
 
+    # 데이터베이스에 저장 (옵션)
+    if save_to_db:
+        with Session(engine) as session:
+            for i, result in enumerate(processed_results):
+                if not isinstance(result, Exception) and result.success:
+                    try:
+                        save_evaluation_to_db(session, request.test_cases[i], result)
+                        logger.info(f"Saved evaluation result {i} to database")
+                    except Exception as e:
+                        logger.error(f"Failed to save evaluation {i} to database: {e}")
+
     return {"test_results": processed_results}
 
 
@@ -953,3 +1225,137 @@ def root():
         dict: API 상태 메시지
     """
     return {"message": "CoEval API is running"}
+
+
+# ==================== 데이터베이스 조회 엔드포인트 ====================
+
+
+@app.get("/evaluations/{evaluation_id}")
+def get_evaluation(evaluation_id: int):
+    """특정 평가 결과를 ID로 조회하는 엔드포인트
+
+    Args:
+        evaluation_id: 조회할 평가 레코드 ID
+
+    Returns:
+        EvaluationRecord: 평가 레코드
+
+    Raises:
+        HTTPException: 해당 ID의 레코드를 찾을 수 없는 경우 404 오류
+    """
+    with Session(engine) as session:
+        record = get_evaluation_by_id(session, evaluation_id)
+        if not record:
+            raise HTTPException(status_code=404, detail=f"Evaluation {evaluation_id} not found")
+        return record
+
+
+@app.get("/evaluations")
+def list_evaluations(skip: int = 0, limit: int = 100, grade: Optional[str] = None):
+    """모든 평가 결과를 조회하는 엔드포인트 (페이지네이션 지원)
+
+    Args:
+        skip: 건너뛸 레코드 수 (기본값: 0)
+        limit: 최대 반환 레코드 수 (기본값: 100)
+        grade: 등급 필터 (S, A, B, C, D 중 하나, 선택사항)
+
+    Returns:
+        List[EvaluationRecord]: 평가 레코드 리스트
+
+    Example:
+        GET /evaluations?skip=0&limit=10&grade=S
+        - S등급 평가 결과 중 최신 10개 조회
+    """
+    with Session(engine) as session:
+        records = get_all_evaluations(session, skip=skip, limit=limit, grade=grade)
+        return records
+
+
+@app.get("/evaluations/score-range")
+def get_evaluations_by_score(min_score: float = 0.0, max_score: float = 10.0):
+    """점수 범위로 평가 결과를 조회하는 엔드포인트
+
+    Args:
+        min_score: 최소 점수 (0-10 범위, 기본값: 0.0)
+        max_score: 최대 점수 (0-10 범위, 기본값: 10.0)
+
+    Returns:
+        List[EvaluationRecord]: 평가 레코드 리스트
+
+    Example:
+        GET /evaluations/score-range?min_score=7.0&max_score=10.0
+        - 7점 이상 10점 이하의 평가 결과 조회 (A등급 이상)
+    """
+    with Session(engine) as session:
+        records = get_evaluations_by_score_range(session, min_score, max_score)
+        return records
+
+
+@app.delete("/evaluations/{evaluation_id}")
+def delete_evaluation_endpoint(evaluation_id: int):
+    """특정 평가 결과를 삭제하는 엔드포인트
+
+    Args:
+        evaluation_id: 삭제할 평가 레코드 ID
+
+    Returns:
+        dict: 삭제 결과 메시지
+
+    Raises:
+        HTTPException: 해당 ID의 레코드를 찾을 수 없는 경우 404 오류
+    """
+    with Session(engine) as session:
+        success = delete_evaluation(session, evaluation_id)
+        if not success:
+            raise HTTPException(status_code=404, detail=f"Evaluation {evaluation_id} not found")
+        return {"message": f"Evaluation {evaluation_id} deleted successfully"}
+
+
+@app.get("/statistics")
+def get_evaluation_statistics():
+    """평가 통계를 반환하는 엔드포인트
+
+    Returns:
+        dict: 평가 통계
+            - total_evaluations: 총 평가 수
+            - grade_distribution: 등급별 분포 (S, A, B, C, D)
+            - average_score: 평균 점수
+            - success_rate: 합격률 (%)
+
+    Example:
+        GET /statistics
+        {
+            "total_evaluations": 150,
+            "grade_distribution": {"S": 20, "A": 40, "B": 50, "C": 30, "D": 10},
+            "average_score": 6.5,
+            "success_rate": 73.3
+        }
+    """
+    with Session(engine) as session:
+        all_records = get_all_evaluations(session, skip=0, limit=10000)
+
+        if not all_records:
+            return {
+                "total_evaluations": 0,
+                "grade_distribution": {"S": 0, "A": 0, "B": 0, "C": 0, "D": 0},
+                "average_score": 0.0,
+                "success_rate": 0.0
+            }
+
+        total = len(all_records)
+        grade_dist = {"S": 0, "A": 0, "B": 0, "C": 0, "D": 0}
+        total_score = 0.0
+        success_count = 0
+
+        for record in all_records:
+            grade_dist[record.grade] = grade_dist.get(record.grade, 0) + 1
+            total_score += record.total_score
+            if record.success:
+                success_count += 1
+
+        return {
+            "total_evaluations": total,
+            "grade_distribution": grade_dist,
+            "average_score": round(total_score / total, 2) if total > 0 else 0.0,
+            "success_rate": round((success_count / total) * 100, 2) if total > 0 else 0.0
+        }

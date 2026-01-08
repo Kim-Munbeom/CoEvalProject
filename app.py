@@ -55,11 +55,16 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("질문")
-    question = st.text_area(
-        "질문을 입력하세요",
-        height=150,
-        placeholder="예: 주니어 백엔드 개발자가 실력을 빠르게 키우려면 어떻게 해야 하나요?",
-        key="question",
+    question_title = st.text_input(
+        "질문 제목",
+        placeholder="예: 주니어 백엔드 개발자의 실력 향상 방법",
+        key="question_title",
+    )
+    question_content = st.text_area(
+        "질문 내용",
+        height=120,
+        placeholder="예: 2년차 백엔드 개발자입니다. 실력을 빠르게 키우고 싶은데 어떤 방법이 효과적일까요?",
+        key="question_content",
     )
 
 with col2:
@@ -73,164 +78,175 @@ with col2:
 
 # 평가 버튼
 if st.button("🔍 평가 시작", type="primary", use_container_width=True):
-    if not question or not answer:
-        st.error("질문과 답변을 모두 입력해주세요.")
-    else:
-        with st.spinner("평가 중..."):
-            # API 요청 준비
-            payload = {
-                "test_cases": [
-                    {
-                        "input": question,
-                        "actual_output": answer,
+    # 입력 검증
+    if not question_title or not question_title.strip():
+        st.warning("⚠️ 질문 제목을 입력해주세요.")
+        st.stop()
+
+    if not question_content or not question_content.strip():
+        st.warning("⚠️ 질문 내용을 입력해주세요.")
+        st.stop()
+
+    if not answer or not answer.strip():
+        st.error("⚠️ 답변을 입력해주세요.")
+        st.stop()
+
+    with st.spinner("평가 중..."):
+        # API 요청 준비
+        payload = {
+            "test_cases": [
+                {
+                    "input_title": question_title.strip(),
+                    "input_content": question_content.strip(),
+                    "actual_output": answer.strip(),
+                }
+            ]
+        }
+
+        try:
+            # API 호출
+            with httpx.Client() as client:
+                response = client.post(api_url, json=payload, timeout=300.0)
+                response.raise_for_status()
+
+            # 결과 파싱
+            result = response.json()
+
+            # 결과 표시
+            st.success("평가 완료!")
+            st.markdown("---")
+
+            if result.get("test_results"):
+                test_result = result["test_results"][0]
+                rubric = test_result["rubric_evaluation"]
+
+                # 최종 점수 및 등급 표시
+                st.header("🎯 최종 평가 결과")
+
+                col1, col2, col3, col4 = st.columns(4)
+
+                with col1:
+                    # 등급 색상 설정
+                    grade_colors = {
+                        "S": "#FFD700",  # 금색
+                        "A": "#90EE90",  # 연두색
+                        "B": "#87CEEB",  # 하늘색
+                        "C": "#FFA500",  # 주황색
+                        "D": "#FF6347"   # 빨간색
                     }
-                ]
-            }
+                    grade_color = grade_colors.get(rubric["grade"], "#808080")
 
-            try:
-                # API 호출
-                with httpx.Client() as client:
-                    response = client.post(api_url, json=payload, timeout=300.0)
-                    response.raise_for_status()
-
-                    # 결과 파싱
-                    result = response.json()
-
-                # 결과 표시
-                st.success("평가 완료!")
-                st.markdown("---")
-
-                if result.get("test_results"):
-                    test_result = result["test_results"][0]
-                    rubric = test_result["rubric_evaluation"]
-
-                    # 최종 점수 및 등급 표시
-                    st.header("🎯 최종 평가 결과")
-
-                    col1, col2, col3, col4 = st.columns(4)
-
-                    with col1:
-                        # 등급 색상 설정
-                        grade_colors = {
-                            "S": "#FFD700",  # 금색
-                            "A": "#90EE90",  # 연두색
-                            "B": "#87CEEB",  # 하늘색
-                            "C": "#FFA500",  # 주황색
-                            "D": "#FF6347"   # 빨간색
-                        }
-                        grade_color = grade_colors.get(rubric["grade"], "#808080")
-
-                        st.markdown(
-                            f"""
-                            <div style="text-align: center; padding: 20px; background-color: {grade_color}; border-radius: 10px;">
-                                <h1 style="color: white; margin: 0; font-size: 48px;">{rubric['grade']}</h1>
-                                <p style="color: white; margin: 0; font-size: 14px;">등급</p>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-                    with col2:
-                        st.metric(
-                            "총점 (10점 만점)",
-                            f"{rubric['absolute_score']:.1f}",
-                            delta=f"{rubric['grade']} 등급"
-                        )
-
-                    with col3:
-                        st.metric(
-                            "정규화 점수 (0-1)",
-                            f"{rubric['score']:.2f}",
-                            delta=f"합격 기준: {rubric['threshold']:.2f}"
-                        )
-
-                    with col4:
-                        if rubric["success"]:
-                            st.success("✅ 통과")
-                        else:
-                            st.error("❌ 미달")
-
-                    # 평가 근거
-                    st.markdown("---")
-                    st.subheader("📝 평가 근거")
                     st.markdown(
                         f"""
-                        <div style="background-color: #f0f2f6; padding: 20px; border-radius: 10px; border-left: 6px solid {grade_color};">
-                            <p style="color: #1f1f1f; margin: 0; font-size: 16px; line-height: 1.8;">
-                                {rubric['reason']}
-                            </p>
+                        <div style="text-align: center; padding: 20px; background-color: {grade_color}; border-radius: 10px;">
+                            <h1 style="color: white; margin: 0; font-size: 48px;">{rubric['grade']}</h1>
+                            <p style="color: white; margin: 0; font-size: 14px;">등급</p>
                         </div>
                         """,
                         unsafe_allow_html=True,
                     )
 
-                    # 에이전트별 상세 분석
-                    st.markdown("---")
-                    st.header("🤖 에이전트별 상세 분석")
+                with col2:
+                    st.metric(
+                        "총점 (10점 만점)",
+                        f"{rubric['absolute_score']:.1f}",
+                        delta=f"{rubric['grade']} 등급"
+                    )
 
-                    agent_icons = {
-                        "action_master": "🎯",
-                        "pro_proof": "🔬",
-                        "context_guardian": "🌍",
-                        "quality_consensus": "📊"
-                    }
+                with col3:
+                    st.metric(
+                        "정규화 점수 (0-1)",
+                        f"{rubric['score']:.2f}",
+                        delta=f"합격 기준: {rubric['threshold']:.2f}"
+                    )
 
-                    agent_names = {
-                        "action_master": "Action Master (실행성 전문가)",
-                        "pro_proof": "Pro Proof (전문성 검증자)",
-                        "context_guardian": "Context Guardian (현실성 감시자)",
-                        "quality_consensus": "Quality Consensus (최종 조정자)"
-                    }
+                with col4:
+                    if rubric["success"]:
+                        st.success("✅ 통과")
+                    else:
+                        st.error("❌ 미달")
 
-                    for agent in test_result["agent_responses"]:
-                        agent_id = agent["agent_name"]
-                        icon = agent_icons.get(agent_id, "🤖")
-                        name = agent_names.get(agent_id, agent_id)
-
-                        with st.expander(
-                            f"{icon} **{name}** (실행: {agent['execution_time']:.2f}초)",
-                            expanded=(agent_id == "quality_consensus")
-                        ):
-                            st.markdown(agent["response_text"])
-
-                            # 토큰 사용량 정보
-                            if agent.get("token_usage"):
-                                st.caption(
-                                    f"📊 토큰 사용량: {agent['token_usage'].get('totalTokens', 0):,} "
-                                    f"(입력: {agent['token_usage'].get('inputTokens', 0):,}, "
-                                    f"출력: {agent['token_usage'].get('outputTokens', 0):,})"
-                                )
-
-                    # 실행 정보
-                    st.markdown("---")
-                    st.subheader("⚡ 실행 정보")
-
-                    info_col1, info_col2, info_col3 = st.columns(3)
-
-                    with info_col1:
-                        st.metric("총 실행 시간", f"{test_result['total_execution_time']:.2f}초")
-
-                    with info_col2:
-                        st.metric("총 토큰 사용량", f"{test_result['total_tokens']:,}")
-
-                    with info_col3:
-                        st.metric("평가 비용", f"${rubric['evaluation_cost']:.4f}")
-
-                    st.caption(f"실행 순서: {' → '.join(test_result['execution_order'])}")
-                    st.caption(f"평가 모델: {rubric['evaluation_model']}")
-
-                    # JSON 결과 보기
-                    with st.expander("🔍 전체 JSON 결과 보기"):
-                        st.json(result)
-
-            except httpx.ConnectError:
-                st.error(
-                    f"❌ API 서버에 연결할 수 없습니다. {api_url}이 실행 중인지 확인하세요."
+                # 평가 근거
+                st.markdown("---")
+                st.subheader("📝 평가 근거")
+                st.markdown(
+                    f"""
+                    <div style="background-color: #f0f2f6; padding: 20px; border-radius: 10px; border-left: 6px solid {grade_color};">
+                        <p style="color: #1f1f1f; margin: 0; font-size: 16px; line-height: 1.8;">
+                            {rubric['reason']}
+                        </p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
                 )
-            except httpx.HTTPStatusError as e:
-                st.error(f"❌ API 요청 중 오류가 발생했습니다: {str(e)}")
-            except Exception as e:
-                st.error(f"❌ 오류가 발생했습니다: {str(e)}")
+
+                # 에이전트별 상세 분석
+                st.markdown("---")
+                st.header("🤖 에이전트별 상세 분석")
+
+                agent_icons = {
+                    "action_master": "🎯",
+                    "pro_proof": "🔬",
+                    "context_guardian": "🌍",
+                    "quality_consensus": "📊"
+                }
+
+                agent_names = {
+                    "action_master": "Action Master (실행성 전문가)",
+                    "pro_proof": "Pro Proof (전문성 검증자)",
+                    "context_guardian": "Context Guardian (현실성 감시자)",
+                    "quality_consensus": "Quality Consensus (최종 조정자)"
+                }
+
+                for agent in test_result["agent_responses"]:
+                    agent_id = agent["agent_name"]
+                    icon = agent_icons.get(agent_id, "🤖")
+                    name = agent_names.get(agent_id, agent_id)
+
+                    with st.expander(
+                        f"{icon} **{name}** (실행: {agent['execution_time']:.2f}초)",
+                        expanded=(agent_id == "quality_consensus")
+                    ):
+                        st.markdown(agent["response_text"])
+
+                        # 토큰 사용량 정보
+                        if agent.get("token_usage"):
+                            st.caption(
+                                f"📊 토큰 사용량: {agent['token_usage'].get('totalTokens', 0):,} "
+                                f"(입력: {agent['token_usage'].get('inputTokens', 0):,}, "
+                                f"출력: {agent['token_usage'].get('outputTokens', 0):,})"
+                            )
+
+                # 실행 정보
+                st.markdown("---")
+                st.subheader("⚡ 실행 정보")
+
+                info_col1, info_col2, info_col3 = st.columns(3)
+
+                with info_col1:
+                    st.metric("총 실행 시간", f"{test_result['total_execution_time']:.2f}초")
+
+                with info_col2:
+                    st.metric("총 토큰 사용량", f"{test_result['total_tokens']:,}")
+
+                with info_col3:
+                    st.metric("평가 비용", f"${rubric['evaluation_cost']:.4f}")
+
+                st.caption(f"실행 순서: {' → '.join(test_result['execution_order'])}")
+                st.caption(f"평가 모델: {rubric['evaluation_model']}")
+
+                # JSON 결과 보기
+                with st.expander("🔍 전체 JSON 결과 보기"):
+                    st.json(result)
+
+        except httpx.ConnectError:
+            st.error(
+                f"❌ API 서버에 연결할 수 없습니다. {api_url}이 실행 중인지 확인하세요."
+            )
+        except httpx.HTTPStatusError as e:
+            st.error(f"❌ API 요청 중 오류가 발생했습니다: {str(e)}")
+        except Exception as e:
+            st.error(f"❌ 오류가 발생했습니다: {str(e)}")
 
 # 샘플 데이터 섹션
 st.markdown("---")
@@ -261,11 +277,22 @@ if st.session_state.show_samples:
     st.subheader(f"📚 {sample_type} 예시 목록")
 
     for idx, example in enumerate(samples):
+        # Use title if available, otherwise extract from question
+        title = example.get('question_title', example.get('question', '')[:50] + '...')
         with st.expander(
-            f"예시 {idx + 1}: {example['question'][:50]}...", expanded=False
+            f"예시 {idx + 1}: {title}", expanded=False
         ):
-            st.markdown(f"**질문:**")
-            st.info(example["question"])
+            # 제목과 내용 구조가 있는 경우
+            if 'question_title' in example:
+                st.markdown(f"**질문 제목:**")
+                st.markdown(f"**{example['question_title']}**")
+
+                st.markdown(f"**질문 내용:**")
+                st.info(example['question_content'])
+            # 이전 형식 (하위 호환성)
+            elif 'question' in example:
+                st.markdown(f"**질문:**")
+                st.info(example["question"])
 
             st.markdown(f"**답변:**")
             st.text_area(
@@ -283,11 +310,19 @@ if st.session_state.show_samples:
                 use_container_width=True,
             ):
                 # 기존 위젯 키 삭제
-                for key in ["question", "answer"]:
+                for key in ["question_title", "question_content", "answer"]:
                     if key in st.session_state:
                         del st.session_state[key]
+
                 # 새 값 설정
-                st.session_state.question = example["question"]
+                if 'question_title' in example:
+                    st.session_state.question_title = example['question_title']
+                    st.session_state.question_content = example['question_content']
+                else:
+                    # 이전 형식의 경우 첫 50자를 제목으로, 전체를 내용으로
+                    st.session_state.question_title = example['question'][:50]
+                    st.session_state.question_content = example['question']
+
                 st.session_state.answer = example["answer"]
                 st.session_state.show_samples = None  # 목록 숨기기
                 st.rerun()

@@ -221,3 +221,5 @@ __marimo__/
 uv.lock
 _tutorial
 .claude
+plan
+coeval.db
