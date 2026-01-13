@@ -32,6 +32,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import List, Optional, Dict, Any
+from zoneinfo import ZoneInfo
 
 from deepeval.metrics import GEval
 from deepeval.metrics.g_eval import Rubric
@@ -87,14 +88,23 @@ genai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 # ==================== SQLModel 데이터베이스 모델 ====================
 
 
+def get_kst_now() -> datetime:
+    """Asia/Seoul 타임존의 현재 시간을 반환하는 함수
+
+    Returns:
+        datetime: Asia/Seoul 타임존의 현재 시간
+    """
+    return datetime.now(ZoneInfo("Asia/Seoul"))
+
+
 class EvaluationRecord(SQLModel, table=True):
-    """평가 결과를 저장하는 SQLModel 테이
+    """평가 결과를 저장하는 SQLModel 테이블
 
     멘토링 답변 평가 결과를 데이터베이스에 영구 저장합니다.
     """
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=get_kst_now)
 
     # 입력 데이터
     mentee_question_title: str = Field(index=True)
