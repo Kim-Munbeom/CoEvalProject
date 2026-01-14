@@ -150,7 +150,7 @@ class EvaluationRecord(SQLModel, table=True):
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./coeval.db")
 
 # 데이터베이스 엔진 생성
-engine = create_engine(DATABASE_URL, echo=False)
+engine = create_engine(DATABASE_URL, echo=True)
 
 
 def create_db_and_tables():
