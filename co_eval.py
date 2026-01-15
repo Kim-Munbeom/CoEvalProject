@@ -29,8 +29,10 @@ import concurrent.futures
 import json
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
+from enum import Enum
 from typing import List, Optional, Dict, Any
 from zoneinfo import ZoneInfo
 
@@ -39,7 +41,7 @@ from deepeval.metrics.g_eval import Rubric
 from deepeval.models import GeminiModel as DeepEvalGeminiModel
 from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from pydantic import BaseModel
@@ -174,8 +176,19 @@ async def lifespan(app: FastAPI):
     # Startup: 데이터베이스 초기화
     create_db_and_tables()
     logger.info("Database tables created successfully")
+
+    # Start background job cleanup task
+    cleanup_task = asyncio.create_task(periodic_job_cleanup())
+    logger.info("Started periodic job cleanup task")
+
     yield
-    # Shutdown: 필요한 정리 작업 (현재는 없음)
+
+    # Shutdown: 정리 작업
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
     logger.info("Application shutdown")
 
 
@@ -1055,6 +1068,54 @@ async def process_single_test_case(
         return test_result
 
 
+async def process_single_test_case_background(
+    job_id: str, test_case: TestCaseRequest, index: int
+):
+    """Process a single test case in the background with job tracking
+
+    This function:
+    1. Updates job status to PROCESSING
+    2. Runs the full evaluation pipeline
+    3. Saves result to database
+    4. Updates job status to COMPLETED (with db_record_id)
+    5. Handles all errors gracefully
+
+    Args:
+        job_id: Unique job identifier
+        test_case: Test case to evaluate
+        index: Test case index in the original request
+    """
+    try:
+        # Update status to PROCESSING
+        await update_job_status(job_id, JobStatus.PROCESSING)
+        logger.info(f"Job {job_id}: Started processing test case {index}")
+
+        # Run the evaluation (this is the heavy part: 20-60 seconds)
+        result = await process_single_test_case(test_case, index)
+
+        # Save to database (100-500ms)
+        db_record_id = None
+        try:
+            with Session(engine) as session:
+                record = save_evaluation_to_db(session, test_case, result)
+                db_record_id = record.id
+                logger.info(f"Job {job_id}: Saved to database with ID {db_record_id}")
+        except Exception as db_error:
+            logger.error(f"Job {job_id}: Database save failed: {db_error}")
+            # Continue even if DB save fails - result is still available
+
+        # Update job status to COMPLETED
+        await update_job_status(
+            job_id, JobStatus.COMPLETED, result=result, db_record_id=db_record_id
+        )
+        logger.info(f"Job {job_id}: Completed successfully")
+
+    except Exception as e:
+        logger.error(f"Job {job_id}: Evaluation failed: {str(e)}")
+        # Update job status to FAILED
+        await update_job_status(job_id, JobStatus.FAILED, error=str(e))
+
+
 # ==================== Pydantic 모델 정의 ====================
 # FastAPI의 요청/응답 스키마를 정의하는 모델들
 
@@ -1100,6 +1161,59 @@ class RubricEvaluationDetail(BaseModel):
     evaluation_model: str  # 평가에 사용된 모델 이름
 
 
+# ==================== Job Management Models ====================
+
+
+class JobStatus(str, Enum):
+    """Job processing status"""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class JobResult(BaseModel):
+    """In-memory job result storage"""
+
+    job_id: str
+    test_case_index: int
+    status: JobStatus
+    created_at: datetime
+    updated_at: datetime
+    result: Optional["TestResultResponse"] = None
+    error: Optional[str] = None
+    db_record_id: Optional[int] = None
+
+
+class JobSubmitResponse(BaseModel):
+    """Response for /evaluate endpoint"""
+
+    jobs: List[Dict[str, Any]]  # [{job_id: "xxx", index: 0, status: "pending"}]
+    message: str
+
+
+class JobStatusResponse(BaseModel):
+    """Response for /evaluate/status/{job_id} endpoint"""
+
+    job_id: str
+    test_case_index: int
+    status: JobStatus
+    created_at: datetime
+    updated_at: datetime
+    result: Optional["TestResultResponse"] = None
+    error: Optional[str] = None
+    db_record_id: Optional[int] = None
+
+
+# In-memory job storage (thread-safe)
+job_storage: Dict[str, JobResult] = {}
+job_storage_lock = asyncio.Lock()
+
+# Job retention settings
+JOB_RETENTION_HOURS = 24  # Keep job results for 24 hours
+
+
 class TestResultResponse(BaseModel):
     """단일 테스트 케이스의 평가 결과"""
 
@@ -1131,124 +1245,265 @@ class EvaluationResponse(BaseModel):
     test_results: List[TestResultResponse]
 
 
+# ==================== Job Management Helper Functions ====================
+
+
+def generate_job_id() -> str:
+    """Generate unique job ID using UUID4"""
+    return str(uuid.uuid4())
+
+
+async def store_job_result(job_result: JobResult):
+    """Store job result in memory (thread-safe)"""
+    async with job_storage_lock:
+        job_storage[job_result.job_id] = job_result
+        logger.info(f"Stored job {job_result.job_id} with status {job_result.status}")
+
+
+async def get_job_result(job_id: str) -> Optional[JobResult]:
+    """Retrieve job result from memory (thread-safe)"""
+    async with job_storage_lock:
+        return job_storage.get(job_id)
+
+
+async def update_job_status(
+    job_id: str,
+    status: JobStatus,
+    result: Optional[TestResultResponse] = None,
+    error: Optional[str] = None,
+    db_record_id: Optional[int] = None,
+):
+    """Update job status in memory"""
+    async with job_storage_lock:
+        if job_id in job_storage:
+            job_storage[job_id].status = status
+            job_storage[job_id].updated_at = get_kst_now()
+            if result:
+                job_storage[job_id].result = result
+            if error:
+                job_storage[job_id].error = error
+            if db_record_id:
+                job_storage[job_id].db_record_id = db_record_id
+            logger.info(f"Updated job {job_id} to status {status}")
+
+
+async def cleanup_old_jobs():
+    """Remove jobs older than JOB_RETENTION_HOURS (run periodically)"""
+    async with job_storage_lock:
+        cutoff_time = get_kst_now() - timedelta(hours=JOB_RETENTION_HOURS)
+        expired_jobs = [
+            job_id
+            for job_id, job in job_storage.items()
+            if job.created_at < cutoff_time
+        ]
+        for job_id in expired_jobs:
+            del job_storage[job_id]
+            logger.info(f"Cleaned up expired job {job_id}")
+
+
+async def periodic_job_cleanup():
+    """Periodically clean up old jobs (runs every hour)"""
+    while True:
+        try:
+            await asyncio.sleep(3600)  # Run every hour
+            await cleanup_old_jobs()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Job cleanup error: {e}")
+
+
 # ==================== FastAPI 엔드포인트 ====================
 
 
-@app.post("/evaluate", response_model=EvaluationResponse)
-async def evaluate_test_cases(request: EvaluationRequest, save_to_db: bool = True):
-    """멘토링 답변을 평가하는 메인 API 엔드포인트 (Phase 2: 비동기 최적화 버전)
+@app.post("/evaluate", response_model=JobSubmitResponse)
+async def evaluate_test_cases(
+    request: EvaluationRequest, background_tasks: BackgroundTasks
+):
+    """Submit mentoring answer evaluation jobs (Immediate response)
 
-    이 엔드포인트는 두 단계의 평가 프로세스를 수행합니다:
-    1. 멀티 에이전트 시스템을 통한 정성적 분석
-       - action_master: 실행 지침 구체성 평가
-       - pro_proof: 실무 전문성 검증
-       - context_guardian: 현실성 분석
-       - quality_consensus: 종합 리포트 작성
+    This endpoint creates background jobs for each test case and returns immediately
+    with job IDs. Laravel server can then poll /evaluate/status/{job_id} to check
+    progress and retrieve results.
 
-    2. DeepEval Rubric 기반 정량적 점수 산출
-       - 에이전트 분석 결과를 바탕으로 0-10 스케일 점수 산출
-       - D/C/B/A/S 등급 자동 산정
-
-    Phase 1 최적화:
-    - 모든 테스트 케이스를 병렬로 처리하여 60-80% 성능 향상
-    - Semaphore로 동시 실행 수 제한 (기본 5개)
-    - 일부 실패 시에도 부분 결과 반환
-
-    Phase 2 최적화:
-    - 비동기 함수 사용 (run_multi_agent_evaluation_async, run_rubric_evaluation_async)
-    - ThreadPoolExecutor를 통한 최적화된 스레드 관리
-    - 번역도 비동기로 처리 (translate_to_korean_async)
-    - DeepEval의 a_measure() 비동기 메서드 활용
+    Architecture:
+    - Immediate response (< 100ms): Returns list of job_ids
+    - Background processing: Each test case runs independently
+    - Job tracking: In-memory storage + database persistence
+    - Timeout-proof: No blocking operations in request handler
 
     Args:
-        request: 평가할 테스트 케이스들을 포함한 요청 객체
-        save_to_db: 평가 결과를 데이터베이스에 저장할지 여부 (기본값: True)
+        request: Evaluation request with multiple test cases
+        background_tasks: FastAPI BackgroundTasks for async processing
 
     Returns:
-        EvaluationResponse: 각 테스트 케이스의 평가 결과를 포함한 응답 객체
-            - 각 에이전트의 상세 분석
-            - 최종 합의 리포트
-            - Rubric 점수 및 등급
-            - 실행 시간 및 토큰 사용량
+        JobSubmitResponse: List of job IDs with status "pending"
 
     Example:
         Request:
         {
             "test_cases": [
-                {
-                    "input": "주니어 개발자인데 코드 리뷰를 잘 받는 방법을 알려주세요",
-                    "actual_output": "코드 리뷰를 잘 받으려면..."
-                }
+                {"input_title": "...", "input_content": "...", "actual_output": "..."},
+                {"input_title": "...", "input_content": "...", "actual_output": "..."}
             ]
         }
 
-        Response:
+        Response (< 100ms):
         {
-            "test_results": [
-                {
-                    "test_case_index": 0,
-                    "rubric_evaluation": {
-                        "score": 0.85,
-                        "grade": "A",
-                        ...
-                    },
-                    ...
-                }
-            ]
+            "jobs": [
+                {"job_id": "abc-123", "index": 0, "status": "pending"},
+                {"job_id": "def-456", "index": 1, "status": "pending"}
+            ],
+            "message": "2 evaluation jobs submitted successfully"
         }
     """
+    jobs = []
 
-    # 모든 테스트 케이스를 병렬 처리
-    tasks = [process_single_test_case(tc, i) for i, tc in enumerate(request.test_cases)]
+    # Create job for each test case
+    for i, test_case in enumerate(request.test_cases):
+        job_id = generate_job_id()
 
-    # 병렬 실행 (일부 실패해도 계속 진행)
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Store initial job result
+        job_result = JobResult(
+            job_id=job_id,
+            test_case_index=i,
+            status=JobStatus.PENDING,
+            created_at=get_kst_now(),
+            updated_at=get_kst_now(),
+        )
+        await store_job_result(job_result)
 
-    # 에러 처리 (일부 실패해도 부분 결과 반환)
-    processed_results = []
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            # 에러 발생 시 에러 응답 생성
-            error_result = TestResultResponse(
-                test_case_index=i,
-                input_title=request.test_cases[i].input_title,
-                input_content=request.test_cases[i].input_content,
-                actual_output=request.test_cases[i].actual_output,
-                expected_output=request.test_cases[i].expected_output,
-                agent_responses=[],
-                final_consensus=f"평가 중 오류 발생: {str(result)}",
-                rubric_evaluation=RubricEvaluationDetail(
-                    score=0.0,
-                    absolute_score=0.0,
-                    grade="D",
-                    threshold=0.7,
-                    success=False,
-                    reason=f"평가 실패: {str(result)}",
-                    reason_en=f"Evaluation failed: {str(result)}",
-                    evaluation_cost=0.0,
-                    evaluation_model="N/A",
-                ),
-                total_execution_time=0.0,
-                total_tokens=0,
-                execution_order=[],
-                success=False,
+        # Add background task (non-blocking)
+        background_tasks.add_task(
+            process_single_test_case_background, job_id, test_case, i
+        )
+
+        jobs.append({"job_id": job_id, "index": i, "status": JobStatus.PENDING})
+
+        logger.info(f"Created job {job_id} for test case {i}")
+
+    return JobSubmitResponse(
+        jobs=jobs, message=f"{len(jobs)} evaluation job(s) submitted successfully"
+    )
+
+
+@app.get("/evaluate/status/{job_id}", response_model=JobStatusResponse)
+async def get_evaluation_status(job_id: str):
+    """Get evaluation job status and result
+
+    Laravel server polls this endpoint to check job progress and retrieve results.
+
+    Job lifecycle:
+    - PENDING: Job created, waiting for processing
+    - PROCESSING: Evaluation in progress
+    - COMPLETED: Evaluation done, result available (includes db_record_id)
+    - FAILED: Evaluation failed, error message available
+
+    Args:
+        job_id: Unique job identifier from /evaluate response
+
+    Returns:
+        JobStatusResponse: Job status with result (if completed)
+
+    Raises:
+        HTTPException 404: Job ID not found
+
+    Example:
+        GET /evaluate/status/abc-123
+
+        Response (PROCESSING):
+        {
+            "job_id": "abc-123",
+            "test_case_index": 0,
+            "status": "processing",
+            "created_at": "2026-01-14T10:00:00+09:00",
+            "updated_at": "2026-01-14T10:00:05+09:00",
+            "result": null,
+            "error": null,
+            "db_record_id": null
+        }
+
+        Response (COMPLETED):
+        {
+            "job_id": "abc-123",
+            "test_case_index": 0,
+            "status": "completed",
+            "created_at": "2026-01-14T10:00:00+09:00",
+            "updated_at": "2026-01-14T10:00:45+09:00",
+            "result": {
+                "test_case_index": 0,
+                "rubric_evaluation": {...},
+                "agent_responses": [...],
+                ...
+            },
+            "error": null,
+            "db_record_id": 123
+        }
+    """
+    job_result = await get_job_result(job_id)
+
+    if not job_result:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Job {job_id} not found. It may have expired (retention: {JOB_RETENTION_HOURS}h)",
+        )
+
+    return JobStatusResponse(
+        job_id=job_result.job_id,
+        test_case_index=job_result.test_case_index,
+        status=job_result.status,
+        created_at=job_result.created_at,
+        updated_at=job_result.updated_at,
+        result=job_result.result,
+        error=job_result.error,
+        db_record_id=job_result.db_record_id,
+    )
+
+
+@app.post("/evaluate/status/batch")
+async def get_evaluation_status_batch(job_ids: List[str]):
+    """Get status for multiple jobs in a single request
+
+    Optimized endpoint for Laravel to check multiple job statuses at once,
+    reducing API call overhead.
+
+    Args:
+        job_ids: List of job IDs to query
+
+    Returns:
+        List[JobStatusResponse]: Status for each job (nulls for not found)
+
+    Example:
+        POST /evaluate/status/batch
+        Body: ["abc-123", "def-456", "ghi-789"]
+
+        Response:
+        [
+            {"job_id": "abc-123", "status": "completed", ...},
+            {"job_id": "def-456", "status": "processing", ...},
+            {"job_id": "ghi-789", "status": "pending", ...}
+        ]
+    """
+    results = []
+    for job_id in job_ids:
+        job_result = await get_job_result(job_id)
+        if job_result:
+            results.append(
+                JobStatusResponse(
+                    job_id=job_result.job_id,
+                    test_case_index=job_result.test_case_index,
+                    status=job_result.status,
+                    created_at=job_result.created_at,
+                    updated_at=job_result.updated_at,
+                    result=job_result.result,
+                    error=job_result.error,
+                    db_record_id=job_result.db_record_id,
+                )
             )
-            processed_results.append(error_result)
         else:
-            processed_results.append(result)
+            results.append(None)  # Job not found
 
-    # 데이터베이스에 저장 (옵션)
-    if save_to_db:
-        with Session(engine) as session:
-            for i, result in enumerate(processed_results):
-                if not isinstance(result, Exception) and result.success:
-                    try:
-                        save_evaluation_to_db(session, request.test_cases[i], result)
-                        logger.info(f"Saved evaluation result {i} to database")
-                    except Exception as e:
-                        logger.error(f"Failed to save evaluation {i} to database: {e}")
-
-    return {"test_results": processed_results}
+    return results
 
 
 @app.get("/")
